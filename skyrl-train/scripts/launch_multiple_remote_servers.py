@@ -11,7 +11,13 @@ import argparse
 import os
 import ray
 import subprocess
-from ray.util.placement_group import placement_group, PlacementGroupSchedulingStrategy
+from ray.util.placement_group import placement_group
+
+try:
+    # Ray < 2.55
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
+except ImportError:  # Ray >= 2.55
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from skyrl_train.utils import get_ray_pg_ready_with_timeout
 from skyrl_train.utils.utils import initialize_ray
 import socket

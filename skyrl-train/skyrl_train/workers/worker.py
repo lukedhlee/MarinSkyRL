@@ -17,10 +17,15 @@ import torch.distributed
 from ray import ObjectRef
 from ray.util.placement_group import (
     PlacementGroup,
-    PlacementGroupSchedulingStrategy,
     placement_group,
     placement_group_table,
 )
+
+try:
+    # Ray < 2.55
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
+except ImportError:  # Ray >= 2.55
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from skyrl_train.utils import ray_noset_visible_devices, get_ray_pg_ready_with_timeout, get_reordered_bundle_indices
 from skyrl_train.utils.constants import SKYRL_RAY_PG_TIMEOUT_IN_S, SKYRL_WORKER_NCCL_TIMEOUT_IN_S
