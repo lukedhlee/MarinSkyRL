@@ -427,11 +427,17 @@ class SkyRLGymGenerator(GeneratorInterface):
             # Close the environment
             await self._run_in_executor_if_available(env.close)
 
+        # Must match InferenceEngineClient.generate: return_dict=True so a *batch*
+        # of conversations yields List[List[int]]. Without it, some tokenizers
+        # (Qwen3) return a short/odd structure → validate_generator_output
+        # "responses (8) vs prompt_token_ids (2)" on Vista gsm8k (843220/843241).
         prompt_token_ids = self.tokenizer.apply_chat_template(
             init_prompts,
             add_generation_prompt=True,
+            add_special_tokens=False,
+            return_dict=True,
             tokenize=True,
-        )
+        )["input_ids"]
         rollout_metrics = get_rollout_metrics(responses, rewards, env_metrics, env_classes)
 
         if self.generator_cfg.apply_overlong_filtering:
