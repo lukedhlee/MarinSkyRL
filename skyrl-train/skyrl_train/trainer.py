@@ -413,7 +413,10 @@ class RayPPOTrainer:
                 return
 
         if self.colocate_all:
-            self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
+            # Offload model too: colocated vLLM (~60GB for 30B-A3B) + FSDP shard leaves
+            # no HBM for DTensor all_gather in broadcast_to_inference_engines (Vista 843025).
+            # extract_weights moves params to GPU one-at-a-time; matches 80B Stage-7 pattern.
+            self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=True)
             await self.inference_engine_client.wake_up(tags=["weights"])
         with Timer("sync_weights"):
             ray.get(self.sync_policy_weights_to_inference_engines())
@@ -545,7 +548,7 @@ class RayPPOTrainer:
 
                     # 5. sync weights to inference engines (must happen before callbacks)
                     if self.colocate_all:
-                        self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
+                        self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=True)
                         await self.inference_engine_client.wake_up(tags=["weights"])
                     with Timer("sync_weights", self.all_timings):
                         ray.get(self.sync_policy_weights_to_inference_engines())
