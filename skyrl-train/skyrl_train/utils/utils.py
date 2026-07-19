@@ -12,10 +12,19 @@ from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from ray.util.placement_group import (
     placement_group,
-    PlacementGroupSchedulingStrategy,
     PlacementGroup,
     placement_group_table,
 )
+
+try:
+    # Ray < 2.55
+    try:
+    # Ray < 2.55
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
+except ImportError:  # Ray >= 2.55
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+except ImportError:  # Ray >= 2.55
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .constants import (
     SKYRL_LD_LIBRARY_PATH_EXPORT,

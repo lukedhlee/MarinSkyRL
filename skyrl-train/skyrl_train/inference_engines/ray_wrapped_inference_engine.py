@@ -3,7 +3,17 @@ from loguru import logger
 from packaging import version
 from ray.actor import ActorHandle
 from typing import Any, List, Dict
-from ray.util.placement_group import PlacementGroupSchedulingStrategy, placement_group
+from ray.util.placement_group import placement_group
+
+try:
+    # Ray < 2.55
+    try:
+    # Ray < 2.55
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
+except ImportError:  # Ray >= 2.55
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+except ImportError:  # Ray >= 2.55
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from skyrl_train.inference_engines.base import (
     InferenceEngineInterface,

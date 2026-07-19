@@ -7,7 +7,11 @@ from typing import List
 from http import HTTPStatus
 from typing import Tuple
 import ray
-from ray.util.placement_group import PlacementGroupSchedulingStrategy
+try:
+    # Ray < 2.55
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
+except ImportError:  # Ray >= 2.55
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 
 def get_vllm_sampling_params(sampling_params: DictConfig) -> Dict[str, Any]:
