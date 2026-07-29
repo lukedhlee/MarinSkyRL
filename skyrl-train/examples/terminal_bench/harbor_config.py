@@ -160,6 +160,10 @@ ENVIRONMENT_SCHEMA = SectionSchema(
         "override_gpus": FieldMapping("override_gpus"),
         "environment_type": FieldMapping("type"),  # Maps to EnvironmentConfig.type
         "import_path": FieldMapping("import_path"),  # Custom environment class
+        # Remote Apptainer bridge support. These are ordinary Harbor
+        # EnvironmentConfig kwargs consumed by ApptainerEnvironment.
+        "bridge_url": FieldMapping("bridge_url", field_type="kwargs"),
+        "sif_cache": FieldMapping("sif_cache", field_type="kwargs"),
         # Pool-based environment kwargs (for PooledDaytonaDinDEnvironment)
         "pool_size": FieldMapping("pool_size", field_type="kwargs"),
         "acquire_timeout": FieldMapping("acquire_timeout", field_type="kwargs"),
