@@ -49,6 +49,10 @@ from examples.terminal_bench.harbor_config import HarborConfigBuilder
 MAX_ORCHESTRATOR_RESTART_ATTEMPTS = 3
 
 
+class InfrastructureFailureError(RuntimeError):
+    """Raised when fail-loud mode detects a non-model rollout failure."""
+
+
 # Backward-compatible alias. The coercion now lives in
 # ``skyrl_train.generators.utils.normalize_token_ids`` so it can be shared with
 # the response-side ``len()``-slicing sites (``get_generation_prompt_ids`` /
@@ -695,6 +699,11 @@ class TerminalBenchGenerator(GeneratorInterface):
         Used when the orchestrator itself fails and cannot process any trials.
         All outputs are marked as infrastructure failures (excluded from baseline).
         """
+        self._raise_if_fail_loud(
+            is_infrastructure=True,
+            exception_type=exception_type,
+            detail="The Harbor orchestrator could not process the rollout batch.",
+        )
         num_trials = len(trajectory_ids)
         return {
             "prompt_token_ids": [[0] for _ in range(num_trials)],
@@ -869,6 +878,16 @@ class TerminalBenchGenerator(GeneratorInterface):
             # like the orchestrator/exception paths above.
             try:
                 output = self._process_trial_result(result, trajectory_id)
+                self._raise_if_fail_loud(
+                    is_infrastructure=bool(
+                        output.stop_reason == "error"
+                        and output.exclude_from_baseline
+                    ),
+                    exception_type=output.exception_type or "UnknownInfrastructureError",
+                    detail=f"Trajectory {trajectory_id} failed outside the model.",
+                )
+            except InfrastructureFailureError:
+                raise
             except Exception as process_error:
                 exclude_from_baseline, exception_type = self._classify_exception(process_error)
                 # _classify_exception may return the _PASSTHROUGH sentinel; for a
@@ -876,6 +895,14 @@ class TerminalBenchGenerator(GeneratorInterface):
                 # to pass through, so coerce it to a masked (excluded) failure.
                 if exclude_from_baseline is self._PASSTHROUGH:
                     exclude_from_baseline = True
+                self._raise_if_fail_loud(
+                    is_infrastructure=bool(exclude_from_baseline),
+                    exception_type=exception_type,
+                    detail=(
+                        f"Trajectory {trajectory_id} failed during result processing: "
+                        f"{process_error}"
+                    ),
+                )
                 logger.warning(
                     f"Trajectory {trajectory_id} failed during result processing "
                     f"(NOT fatal — skipping this trial): "
@@ -1196,6 +1223,29 @@ class TerminalBenchGenerator(GeneratorInterface):
     # Sentinel: returned by _classify_exception when the exception should be
     # treated as if it never happened (fall through to normal verifier flow).
     _PASSTHROUGH = object()
+
+    def _raise_if_fail_loud(
+        self,
+        *,
+        is_infrastructure: bool,
+        exception_type: str,
+        detail: str,
+    ) -> None:
+        """Abort before infrastructure damage can be reported as model reward 0."""
+        if not is_infrastructure:
+            return
+        if not self._error_handling_config.get(
+            "fail_on_infrastructure_error", False
+        ):
+            return
+
+        message = (
+            f"INFRASTRUCTURE FAILURE [{exception_type}]: {detail} "
+            "Aborting rollout generation so this cannot be interpreted as a "
+            "model-quality failure."
+        )
+        logger.critical(message)
+        raise InfrastructureFailureError(message)
 
     def _classify_exception(self, exception: Exception) -> tuple[bool | object, str]:
         """

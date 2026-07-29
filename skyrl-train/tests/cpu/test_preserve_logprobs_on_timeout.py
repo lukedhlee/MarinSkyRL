@@ -28,7 +28,10 @@ if _EXAMPLES not in sys.path:
 # the CPU dev extra deliberately does not install. Skip the module where it is absent
 # (it still runs in the agentic RL env where harbor is present).
 try:
-    from terminal_bench.terminal_bench_generator import TerminalBenchGenerator  # noqa: E402
+    from terminal_bench.terminal_bench_generator import (  # noqa: E402
+        InfrastructureFailureError,
+        TerminalBenchGenerator,
+    )
 except ImportError:
     pytest.skip("harbor deps unavailable (agentic RL extra not installed)", allow_module_level=True)
 
@@ -77,3 +80,31 @@ def test_rollout_details_without_logprobs_falls_back():
 
 def test_missing_agent_result_falls_back():
     assert _gate(_fake_self(), types.SimpleNamespace(agent_result=None)) is False
+
+
+def test_fail_loud_aborts_infrastructure_failure():
+    fake = types.SimpleNamespace(
+        _error_handling_config={"fail_on_infrastructure_error": True}
+    )
+    with pytest.raises(
+        InfrastructureFailureError,
+        match=r"INFRASTRUCTURE FAILURE \[BridgeOperationTimeoutError\]",
+    ):
+        TerminalBenchGenerator._raise_if_fail_loud(
+            fake,
+            is_infrastructure=True,
+            exception_type="BridgeOperationTimeoutError",
+            detail="Bridge job exceeded its deadline.",
+        )
+
+
+def test_fail_loud_does_not_abort_model_failure():
+    fake = types.SimpleNamespace(
+        _error_handling_config={"fail_on_infrastructure_error": True}
+    )
+    TerminalBenchGenerator._raise_if_fail_loud(
+        fake,
+        is_infrastructure=False,
+        exception_type="AgentTimeoutError",
+        detail="The model used its full time budget.",
+    )

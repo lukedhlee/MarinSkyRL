@@ -26,6 +26,7 @@ if _EXAMPLES not in sys.path:
 try:
     from terminal_bench.harbor_config import (  # noqa: E402
         AGENT_SCHEMA,
+        ERROR_HANDLING_SCHEMA,
         ENVIRONMENT_SCHEMA,
         HarborConfigBuilder,
     )
@@ -47,6 +48,9 @@ def _environment_config(harbor_cfg: dict):
 def test_schema_defaults_are_hygienic():
     assert AGENT_SCHEMA.fields["record_terminal_session"].default is False
     assert AGENT_SCHEMA.fields["trajectory_config"].default == {"raw_content": True}
+    assert (
+        ERROR_HANDLING_SCHEMA.fields["fail_on_infrastructure_error"].default is False
+    )
 
 
 def test_omitted_keys_get_defaults():

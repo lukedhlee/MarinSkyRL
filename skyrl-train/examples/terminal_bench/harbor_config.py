@@ -300,6 +300,11 @@ ERROR_HANDLING_SCHEMA = SectionSchema(
     fields={
         # Enable RLOO-N style error handling (exclude infrastructure failures from baseline)
         "enable_error_classification": FieldMapping("enable_error_classification", default=False),
+        # Abort generation immediately when an exception is classified as
+        # infrastructure. This keeps an infra outage from looking like reward 0.
+        "fail_on_infrastructure_error": FieldMapping(
+            "fail_on_infrastructure_error", default=False
+        ),
         # Exceptions to pass through (ignore exception, use verifier reward normally).
         # The verifier still runs after these errors in Harbor, so we get a real reward.
         # Use for soft limits like timeout/context-length where partial work is evaluated.
@@ -760,6 +765,7 @@ class HarborConfigBuilder:
         Returns:
             Dict with keys:
                 - enable_error_classification: bool - whether to classify errors
+                - fail_on_infrastructure_error: bool - abort on classified infrastructure failures
                 - passthrough_exceptions: Set[str] - exception names to pass through (use verifier reward)
                 - mask_exceptions: Set[str] - exception names to mask (exclude from baseline)
                 - zero_exceptions: Set[str] - exception names to zero (include with reward=0)
