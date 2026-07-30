@@ -20,12 +20,11 @@ notes/skyrl/stage8_scope.md and stage7_scope.md):
 2. **FlashQLA fused tilelang kernel (opt-in via SKYRL_GDN_FLASHQLA=1).** The
    pure-torch GDN path is correct but slow (Stage-8: 27x slower at S=8192).
    When SKYRL_GDN_FLASHQLA=1, after a model is constructed we rebind every
-   `Qwen3NextGatedDeltaNet.chunk_gated_delta_rule` instance attribute to a
-   FlashQLA shim that re-wraps FlashQLA's *functional* fwd/bwd tilelang kernels
-   in a torch-2.9-correct autograd.Function (contiguity-fixed + grad-arity
-   fixed). Requires the Stage-8 fla_tilelang overlay (tilelang 0.1.8 +
-   FlashQLA + apache-tvm-ffi 0.1.9). Falls back to the pure-torch path (a
-   warning, not a crash) if FlashQLA can't be imported.
+   supported Qwen3-Next or Qwen3.5/3.6
+   `*GatedDeltaNet.chunk_gated_delta_rule` instance attribute to a FlashQLA
+   public autograd-enabled kernel. Requires FlashQLA + TileLang (the original
+   Stage-8 overlay or an isolated PyPI install). Falls back to the pure-torch
+   path unless `SKYRL_GDN_FLASHQLA_REQUIRED=1` makes absence fatal.
 
 Usage (call BEFORE transformers' qwen3_next modeling module is imported, then
 again on each constructed model):
@@ -70,71 +69,37 @@ def mask_fla() -> bool:
 
 
 def _build_flashqla_chunk():
-    """Build the FlashQLA chunk_gated_delta_rule drop-in. Returns None if the
-    Stage-8 overlay (tilelang + flash_qla) is not importable."""
-    import torch
+    """Load FlashQLA's autograd-enabled GDN drop-in.
+
+    FlashQLA 0.1.2 exposes the same high-level signature used by Transformers'
+    Qwen3-Next and Qwen3.5/3.6 modules, including internal Q/K L2 normalization.
+    Using that public entry point also avoids depending on the lower-level
+    forward/backward return tuple, which changed between FlashQLA releases.
+    Returns ``None`` if the isolated kernel layer is unavailable.
+    """
     try:
-        from flash_qla import (
-            chunk_gated_delta_rule_fwd as _fqla_fwd,
-            chunk_gated_delta_rule_bwd as _fqla_bwd,
-        )
-        from flash_qla.utils import l2norm as _fqla_l2norm
+        from flash_qla import chunk_gated_delta_rule
     except Exception as e:  # overlay not mounted / import failed
         logger.warning("[gdn] FlashQLA unavailable (%s); staying on pure-torch GDN", e)
         return None
-
-    class _FlashQLAChunk(torch.autograd.Function):
-        @staticmethod
-        @torch.amp.custom_fwd(device_type="cuda")
-        def forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens):
-            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-            g2, A, o, _h, final_state = _fqla_fwd(
-                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                initial_state=initial_state, output_final_state=output_final_state,
-                output_h=False, cu_seqlens=cu_seqlens,
-            )
-            ctx.save_for_backward(q, k, v, g2, beta, A, initial_state, cu_seqlens)
-            ctx.scale = scale
-            ctx.has_initial_state = initial_state is not None
-            return o.to(q.dtype), final_state
-
-        @staticmethod
-        @torch.amp.custom_bwd(device_type="cuda")
-        def backward(ctx, do, dht):
-            q, k, v, g2, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
-            dq, dk, dv, db, dg, dh0 = _fqla_bwd(
-                q=q, k=k, v=v, g=g2, beta=beta, A=A, do=do.contiguous(),
-                dht=dht, scale=ctx.scale, initial_state=initial_state, cu_seqlens=cu_seqlens,
-            )
-            d_init = dh0 if ctx.has_initial_state else None
-            return (dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype),
-                    dg.to(g2.dtype), db.to(beta.dtype), None, d_init, None, None)
-
-    def flashqla_chunk(q, k, v, g=None, beta=None, scale=None, initial_state=None,
-                       output_final_state=False, use_qk_l2norm_in_kernel=False,
-                       cu_seqlens=None, head_first=False):
-        assert not head_first, "head_first unsupported"
-        if scale is None:
-            scale = k.shape[-1] ** -0.5
-        if use_qk_l2norm_in_kernel:
-            q = _fqla_l2norm(q)
-            k = _fqla_l2norm(k)
-        return _FlashQLAChunk.apply(q, k, v, g, beta, scale, initial_state,
-                                    output_final_state, cu_seqlens)
-
-    flashqla_chunk._flashqla = True
-    return flashqla_chunk
+    chunk_gated_delta_rule._flashqla = True
+    return chunk_gated_delta_rule
 
 
 _FLASHQLA_FN = None
+_FLASHQLA_GDN_TYPES = {
+    "Qwen3NextGatedDeltaNet",
+    "Qwen3_5GatedDeltaNet",
+    "Qwen3_5MoeGatedDeltaNet",
+}
 
 
 def engage_flashqla(model) -> int:
-    """Rebind every Qwen3NextGatedDeltaNet's chunk kernel to FlashQLA.
+    """Rebind supported Qwen3-Next/Qwen3.5 GDN chunk kernels to FlashQLA.
 
     No-op (returns 0) unless env SKYRL_GDN_FLASHQLA is truthy. Builds the
     FlashQLA shim once (cached). Returns the number of GDN modules rebound.
-    Safe to call on non-Qwen3-Next models (returns 0).
+    Safe to call on unrelated models (returns 0).
     """
     global _FLASHQLA_FN
     if os.environ.get("SKYRL_GDN_FLASHQLA", "0") not in ("1", "true", "True"):
@@ -142,12 +107,20 @@ def engage_flashqla(model) -> int:
     if _FLASHQLA_FN is None:
         _FLASHQLA_FN = _build_flashqla_chunk()
     if _FLASHQLA_FN is None:
+        if os.environ.get("SKYRL_GDN_FLASHQLA_REQUIRED", "0") in ("1", "true", "True"):
+            raise RuntimeError(
+                "SKYRL_GDN_FLASHQLA_REQUIRED=1 but FlashQLA could not be imported"
+            )
         return 0
     n = 0
     for m in model.modules():
-        if type(m).__name__ == "Qwen3NextGatedDeltaNet":
+        if type(m).__name__ in _FLASHQLA_GDN_TYPES:
             m.chunk_gated_delta_rule = _FLASHQLA_FN
             n += 1
     if n:
         logger.info("[gdn] engaged FlashQLA fused kernel on %d GatedDeltaNet modules", n)
+    elif os.environ.get("SKYRL_GDN_FLASHQLA_REQUIRED", "0") in ("1", "true", "True"):
+        raise RuntimeError(
+            "SKYRL_GDN_FLASHQLA_REQUIRED=1 but no supported GatedDeltaNet modules were found"
+        )
     return n
