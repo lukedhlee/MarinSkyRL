@@ -97,6 +97,11 @@ AGENT_SCHEMA = SectionSchema(
         "max_episodes": FieldMapping("max_episodes", field_type="kwargs", default=16),
         "enable_summarize": FieldMapping("enable_summarize", field_type="kwargs", default=True),
         "store_all_messages": FieldMapping("store_all_messages", field_type="kwargs", default=True),
+        # Installed-agent settings used by OpenCode and other CLI agents.
+        "version": FieldMapping("version", field_type="kwargs"),
+        "preinstalled": FieldMapping("preinstalled", field_type="kwargs"),
+        "prompt_template_path": FieldMapping("prompt_template_path", field_type="kwargs"),
+        "opencode_config": FieldMapping("opencode_config", field_type="kwargs"),
         # Thinking/reasoning settings
         "interleaved_thinking": FieldMapping("interleaved_thinking", field_type="kwargs", default=False),
         # Extra body params passed to LLM API (e.g., chat_template_kwargs for enable_thinking)
@@ -302,9 +307,7 @@ ERROR_HANDLING_SCHEMA = SectionSchema(
         "enable_error_classification": FieldMapping("enable_error_classification", default=False),
         # Abort generation immediately when an exception is classified as
         # infrastructure. This keeps an infra outage from looking like reward 0.
-        "fail_on_infrastructure_error": FieldMapping(
-            "fail_on_infrastructure_error", default=False
-        ),
+        "fail_on_infrastructure_error": FieldMapping("fail_on_infrastructure_error", default=False),
         # Exceptions to pass through (ignore exception, use verifier reward normally).
         # The verifier still runs after these errors in Harbor, so we get a real reward.
         # Use for soft limits like timeout/context-length where partial work is evaluated.
@@ -453,7 +456,7 @@ class HarborConfigBuilder:
 
         prm_kwargs = {k: v for k, v in prm_cfg.items() if k != "name"}
         prm_instance = get_prm(prm_name, **prm_kwargs)
-        logger.info(f"PRM '{prm_name}' enabled as turn_callback " f"(params: {prm_kwargs})")
+        logger.info(f"PRM '{prm_name}' enabled as turn_callback (params: {prm_kwargs})")
         return prm_instance.as_turn_callback()
 
     def _extract_harbor_fields_legacy(self, cfg: DictConfig) -> Dict[str, Any]:
@@ -497,8 +500,7 @@ class HarborConfigBuilder:
                 else:
                     # Completely unknown field
                     self._warn_once(
-                        f"Unknown harbor config key '{key}' - ignoring. "
-                        f"Check spelling or Harbor version compatibility."
+                        f"Unknown harbor config key '{key}' - ignoring. Check spelling or Harbor version compatibility."
                     )
 
     def _warn_once(self, message: str) -> None:

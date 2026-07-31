@@ -48,9 +48,7 @@ def _environment_config(harbor_cfg: dict):
 def test_schema_defaults_are_hygienic():
     assert AGENT_SCHEMA.fields["record_terminal_session"].default is False
     assert AGENT_SCHEMA.fields["trajectory_config"].default == {"raw_content": True}
-    assert (
-        ERROR_HANDLING_SCHEMA.fields["fail_on_infrastructure_error"].default is False
-    )
+    assert ERROR_HANDLING_SCHEMA.fields["fail_on_infrastructure_error"].default is False
 
 
 def test_omitted_keys_get_defaults():
@@ -88,4 +86,46 @@ def test_apptainer_bridge_fields_are_forwarded_as_environment_kwargs():
         "bridge_url": "http://10.128.1.2:9928",
         "sif_cache": "/p/scratch/synthlaion/lee27/r2egym_sif",
         "auto_snapshot": False,
+    }
+
+
+def test_opencode_fields_reach_final_agent_config():
+    cfg = OmegaConf.create(
+        {
+            "harbor": {
+                "name": "opencode",
+                "version": "1.18.8",
+                "preinstalled": True,
+                "prompt_template_path": "/tmp/opencode_prompt.md.j2",
+                "opencode_config": {
+                    "autoupdate": False,
+                    "compaction": {"auto": False},
+                },
+            },
+            "model_info": {
+                "max_input_tokens": 28672,
+                "max_output_tokens": 4096,
+            },
+        }
+    )
+
+    trial = HarborConfigBuilder(cfg).build_trial_config(
+        task_path="/tmp/task",
+        trials_dir="/tmp/trials",
+        model_name="hosted_vllm/qwen3-6-35b-a3b-r2egym",
+        api_base="http://127.0.0.1:8000/v1",
+        session_id="session-1",
+    )
+
+    assert trial.agent.name.value == "opencode"
+    assert trial.agent.kwargs["version"] == "1.18.8"
+    assert trial.agent.kwargs["preinstalled"] is True
+    assert trial.agent.kwargs["prompt_template_path"] == "/tmp/opencode_prompt.md.j2"
+    assert trial.agent.kwargs["opencode_config"] == {
+        "autoupdate": False,
+        "compaction": {"auto": False},
+    }
+    assert trial.agent.kwargs["model_info"] == {
+        "max_input_tokens": 28672,
+        "max_output_tokens": 4096,
     }
