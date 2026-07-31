@@ -117,7 +117,7 @@ def test_opencode_fields_reach_final_agent_config():
         session_id="session-1",
     )
 
-    assert trial.agent.name.value == "opencode"
+    assert trial.agent.name == "opencode"
     assert trial.agent.kwargs["version"] == "1.18.8"
     assert trial.agent.kwargs["preinstalled"] is True
     assert trial.agent.kwargs["prompt_template_path"] == "/tmp/opencode_prompt.md.j2"
