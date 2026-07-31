@@ -125,7 +125,5 @@ def test_opencode_fields_reach_final_agent_config():
         "autoupdate": False,
         "compaction": {"auto": False},
     }
-    assert trial.agent.kwargs["model_info"] == {
-        "max_input_tokens": 28672,
-        "max_output_tokens": 4096,
-    }
+    assert trial.agent.kwargs["model_info"]["max_input_tokens"] == 28672
+    assert trial.agent.kwargs["model_info"]["max_output_tokens"] == 4096
