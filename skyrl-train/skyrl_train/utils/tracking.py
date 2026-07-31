@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import dataclasses
+import os
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -25,6 +26,19 @@ from omegaconf import DictConfig, OmegaConf
 import pprint
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+
+def _wandb_settings_mode() -> str:
+    """Use true offline/disabled mode when the batch environment requests it.
+
+    SkyRL normally uses W&B's ``shared`` mode to aggregate system metrics from
+    multiple nodes. Explicitly setting ``mode=shared`` overrides WANDB_MODE, so
+    air-gapped jobs otherwise attempt an online init and time out.
+    """
+    requested = os.environ.get("WANDB_MODE", "online").strip().lower()
+    if requested in {"offline", "disabled"}:
+        return requested
+    return "shared"
 
 
 @ray.remote
@@ -69,6 +83,8 @@ class Tracking:
             import wandb
             from omegaconf import OmegaConf
 
+            wandb_mode = _wandb_settings_mode()
+
             current_node_ip = "head"
             if ray.is_initialized():
                 try:
@@ -83,14 +99,25 @@ class Tracking:
                 group=experiment_name,
                 resume="allow",
                 settings=wandb.Settings(
-                    mode="shared",  # mainly for multi-node training's systems metrics aggregation
+                    mode=wandb_mode,
                     x_primary=True,
                     x_label=f"node-{current_node_ip}"
                 )
             )
             run_id = run.id
             self.logger["wandb"] = run
-            self._prepare_worker_nodes_systems_logging_wandb(project_name, experiment_name, run_id, config, current_node_ip)
+            if wandb_mode == "shared":
+                self._prepare_worker_nodes_systems_logging_wandb(
+                    project_name,
+                    experiment_name,
+                    run_id,
+                    config,
+                    current_node_ip,
+                )
+            else:
+                # Multiple offline writers cannot aggregate into one local run;
+                # keep the primary logger only.
+                self.remote_loggers = []
 
         if "mlflow" in backends:
             self.logger["mlflow"] = _MlflowLoggingAdapter(project_name, experiment_name, config)
