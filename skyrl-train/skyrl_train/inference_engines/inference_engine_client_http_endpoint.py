@@ -14,19 +14,19 @@ import asyncio
 import json
 import logging
 import time
-import requests
 import traceback
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Optional, Protocol, Dict, Any
+from typing import Any, Dict, Optional, Protocol
 
 import fastapi
+import requests
 import uvicorn
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
-
 
 logger = logging.getLogger(__name__)
 
@@ -102,14 +102,6 @@ def _validate_openai_request(request_json: Dict[str, Any], endpoint: str) -> Opt
                 code=HTTPStatus.BAD_REQUEST.value,
             ),
         )
-    if request_json.get("stream", False):
-        return ErrorResponse(
-            error=ErrorInfo(
-                message="Streaming is not supported in SkyRL yet, please set stream to False.",
-                type=HTTPStatus.BAD_REQUEST.phrase,
-                code=HTTPStatus.BAD_REQUEST.value,
-            ),
-        )
     if endpoint == "/completions" and "n" in request_json and request_json["n"] > 1:
         # TODO(Charlie): this constraint can be removed when we leave DP routing to
         # inference frameworks. Or we could try to resolve it when needed.
@@ -139,7 +131,107 @@ def _validate_openai_request(request_json: Dict[str, Any], endpoint: str) -> Opt
     return None
 
 
-async def handle_openai_request(raw_request: Request, endpoint: str) -> JSONResponse:
+def _stream_chunk_base(response: Dict[str, Any], *, object_name: str) -> Dict[str, Any]:
+    """Return response-level fields suitable for an OpenAI SSE chunk."""
+    chunk = {key: value for key, value in response.items() if key not in {"choices", "object", "usage"}}
+    chunk["object"] = object_name
+    return chunk
+
+
+def _chat_delta(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a complete assistant message into one valid streaming delta."""
+    delta = dict(message)
+    tool_calls = delta.get("tool_calls")
+    if isinstance(tool_calls, list):
+        # The OpenAI streaming schema requires an index on every tool-call delta,
+        # while the non-streaming response schema does not include it.
+        indexed_tool_calls = []
+        for index, tool_call in enumerate(tool_calls):
+            if isinstance(tool_call, dict):
+                tool_call = dict(tool_call)
+                tool_call.setdefault("index", index)
+            indexed_tool_calls.append(tool_call)
+        delta["tool_calls"] = indexed_tool_calls
+    return delta
+
+
+def _buffered_sse_events(
+    response: Dict[str, Any], request_json: Dict[str, Any], endpoint: str
+) -> list[Dict[str, Any] | str]:
+    """Convert one completed backend response to OpenAI-compatible SSE events.
+
+    SkyRL's Ray actors return complete, picklable response dictionaries. Some
+    agent clients (notably OpenCode's AI SDK) require the HTTP transport to use
+    streaming. We therefore keep generation non-streaming behind the proxy and
+    frame the completed response as a short buffered stream at this boundary.
+
+    Token IDs, logprobs, prompt IDs, and provider-specific fields remain on the
+    content event so Harbor's recording proxy can reconstruct exact rollout
+    details for TIS.
+    """
+    assert endpoint in ["/completions", "/chat/completions"]
+    is_chat = endpoint == "/chat/completions"
+    object_name = "chat.completion.chunk" if is_chat else "text_completion"
+    base = _stream_chunk_base(response, object_name=object_name)
+    events: list[Dict[str, Any] | str] = []
+
+    for choice in response.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+
+        # Keep generation metadata on the content event, including extensions
+        # such as token_ids, provider_specific_fields, routed_experts, and
+        # logprobs. Only terminal fields move to the finish event.
+        content_choice = {
+            key: value
+            for key, value in choice.items()
+            if key not in {"message", "text", "finish_reason", "stop_reason"}
+        }
+        content_choice.setdefault("index", choice.get("index", 0))
+        content_choice["finish_reason"] = None
+        if is_chat:
+            message = choice.get("message")
+            content_choice["delta"] = _chat_delta(message if isinstance(message, dict) else {})
+        else:
+            content_choice["text"] = choice.get("text") or ""
+
+        content_event = dict(base)
+        content_event["choices"] = [content_choice]
+        events.append(content_event)
+
+        finish_choice: Dict[str, Any] = {
+            "index": choice.get("index", 0),
+            "finish_reason": choice.get("finish_reason"),
+        }
+        if "stop_reason" in choice:
+            finish_choice["stop_reason"] = choice["stop_reason"]
+        if is_chat:
+            finish_choice["delta"] = {}
+        else:
+            finish_choice["text"] = ""
+        finish_event = dict(base)
+        finish_event["choices"] = [finish_choice]
+        events.append(finish_event)
+
+    stream_options = request_json.get("stream_options")
+    include_usage = isinstance(stream_options, dict) and stream_options.get("include_usage") is True
+    if include_usage and response.get("usage") is not None:
+        usage_event = dict(base)
+        usage_event["choices"] = []
+        usage_event["usage"] = response["usage"]
+        events.append(usage_event)
+
+    events.append("[DONE]")
+    return events
+
+
+async def _serialize_sse_events(events: list[Dict[str, Any] | str]) -> AsyncIterator[str]:
+    for event in events:
+        payload = event if isinstance(event, str) else json.dumps(event, separators=(",", ":"))
+        yield f"data: {payload}\n\n"
+
+
+async def handle_openai_request(raw_request: Request, endpoint: str) -> Response:
     """Handle /completions or /chat/completions request."""
     assert endpoint in ["/completions", "/chat/completions"]
     try:
@@ -151,8 +243,18 @@ async def handle_openai_request(raw_request: Request, endpoint: str) -> JSONResp
             return JSONResponse(content=error_response.model_dump(), status_code=error_response.error.code)
 
         # Serialize fastapi.Request because it is not pickable, which causes ray methods to fail.
+        wants_stream = request_json.get("stream", False) is True
+        backend_request_json = dict(request_json)
+        if wants_stream:
+            # Async generators cannot cross the Ray actor boundary. Generate a
+            # complete response there, then expose it as buffered SSE here.
+            backend_request_json["stream"] = False
+            # vLLM rejects stream_options when stream is false. We still retain
+            # the original options above to decide whether the client requested
+            # the terminal usage chunk.
+            backend_request_json.pop("stream_options", None)
         payload = {
-            "json": request_json,
+            "json": backend_request_json,
             "headers": dict(raw_request.headers) if hasattr(raw_request, "headers") else {},
         }
         if endpoint == "/chat/completions":
@@ -164,6 +266,9 @@ async def handle_openai_request(raw_request: Request, endpoint: str) -> JSONResp
             # former is vllm format, latter is sglang format
             error_code = response["error"]["code"] if "error" in response else response["code"]
             return JSONResponse(content=response, status_code=error_code)
+        elif wants_stream:
+            events = _buffered_sse_events(response, request_json, endpoint)
+            return StreamingResponse(_serialize_sse_events(events), media_type="text/event-stream")
         else:
             return JSONResponse(content=response)
 
@@ -213,7 +318,7 @@ def shutdown_server(host: str = "127.0.0.1", port: int = 8000, max_wait_seconds:
             requests.get(health_url, timeout=1)
         except requests.exceptions.RequestException:
             # A network error / connection refused means server is down.
-            logger.info(f"Server shut down after {i+1} seconds")
+            logger.info(f"Server shut down after {i + 1} seconds")
             return
         time.sleep(1)
 
@@ -239,7 +344,7 @@ def wait_for_server_ready(host: str = "127.0.0.1", port: int = 8000, max_wait_se
         try:
             response = requests.get(health_url, timeout=1)
             if response.status_code == 200:
-                logger.info(f"Server ready after {i+1} attempts ({i+1} seconds)")
+                logger.info(f"Server ready after {i + 1} attempts ({i + 1} seconds)")
                 return
         except (requests.exceptions.RequestException, requests.exceptions.ConnectionError):
             if i == max_retries - 1:

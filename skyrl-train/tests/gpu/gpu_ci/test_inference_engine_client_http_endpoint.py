@@ -640,15 +640,17 @@ def test_http_endpoint_error_handling(ray_init_fixture):
 
         base_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
-        # Test 1: Invalid request - streaming not supported, raised by SkyRL
+        # Test 1: Streaming clients receive OpenAI-compatible buffered SSE.
+        # Generation remains non-streaming behind the Ray boundary because async
+        # generators are not picklable, but streaming-only agent SDKs can consume
+        # the HTTP endpoint.
         response = requests.post(
             f"{base_url}/v1/chat/completions",
             json={"model": MODEL, "messages": [{"role": "user", "content": "Hello"}], "stream": True},
         )
-        assert response.status_code == HTTPStatus.BAD_REQUEST  # 400
-        error_data = response.json()
-        print(f"Error data: {error_data}")
-        assert "Streaming is not supported" in error_data["error"]["message"]
+        assert response.status_code == HTTPStatus.OK
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert "data: [DONE]" in response.text
 
         # Test 2: OAI can take fields not listed in the protocol
         response = requests.post(
