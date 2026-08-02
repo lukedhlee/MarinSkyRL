@@ -899,6 +899,16 @@ class HarborConfigBuilder:
         # This is the Harbor AgentName value directly (e.g., "terminus-2", "oracle")
         agent_name = agent_direct_fields.pop("name", "terminus-2")
 
+        # OpenCode interprets the first model-name segment as its provider id.
+        # ``hosted_vllm/<id>`` is the correct LiteLLM alias for in-process
+        # agents such as terminus-2, but OpenCode has no hosted_vllm provider
+        # registration and otherwise constructs ``undefined/chat/completions``.
+        # Harbor's OpenCode agent registers ``vllm`` with
+        # @ai-sdk/openai-compatible and consumes the api_base above, so preserve
+        # the served id while selecting that proven provider route.
+        if agent_name == "opencode" and model_name.startswith("hosted_vllm/"):
+            model_name = f"vllm/{model_name.removeprefix('hosted_vllm/')}"
+
         # Apply timeout override if provided (e.g., for eval runs)
         if timeout_override_sec is not None:
             agent_direct_fields["override_timeout_sec"] = timeout_override_sec

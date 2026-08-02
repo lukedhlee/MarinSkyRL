@@ -118,6 +118,8 @@ def test_opencode_fields_reach_final_agent_config():
     )
 
     assert trial.agent.name == "opencode"
+    assert trial.agent.model_name == "vllm/qwen3-6-35b-a3b-r2egym"
+    assert trial.agent.kwargs["api_base"] == "http://127.0.0.1:8000/v1"
     assert trial.agent.kwargs["version"] == "1.18.8"
     assert trial.agent.kwargs["preinstalled"] is True
     assert trial.agent.kwargs["prompt_template_path"] == "/tmp/opencode_prompt.md.j2"
