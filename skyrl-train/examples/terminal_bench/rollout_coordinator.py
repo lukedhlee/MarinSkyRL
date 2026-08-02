@@ -409,7 +409,19 @@ class RolloutDispatcher:
         # an explicitly-configured non-loopback host (e.g. a manual remote setup)
         # is respected.
         configured_host = self._generator_cfg.get("http_endpoint_host", None)
-        if configured_host in ("127.0.0.1", "localhost", None):
+        rollout_host = os.environ.get("SKYRL_ROLLOUT_HTTP_ENDPOINT_HOST")
+        rollout_port = os.environ.get("SKYRL_ROLLOUT_HTTP_ENDPOINT_PORT")
+        if rollout_host:
+            self._generator_cfg["http_endpoint_host"] = rollout_host
+            if rollout_port:
+                self._generator_cfg["http_endpoint_port"] = int(rollout_port)
+            _log().info(
+                f"[RolloutDispatcher] using externally routed inference endpoint "
+                f"{self._generator_cfg['http_endpoint_host']}:"
+                f"{self._generator_cfg['http_endpoint_port']} for coordinator "
+                f"litellm base_url connectivity"
+            )
+        elif configured_host in ("127.0.0.1", "localhost", None):
             head_ip = ray.util.get_node_ip_address()
             self._generator_cfg["http_endpoint_host"] = head_ip
             _log().info(
