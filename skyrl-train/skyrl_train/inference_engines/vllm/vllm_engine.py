@@ -1614,6 +1614,12 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
                 request_logger=None,
                 chat_template=custom_chat_template_content,
                 chat_template_content_format="auto",
+                # vLLM 0.22 moved request rendering (including the
+                # tool_choice="auto" validation) into OpenAIServingRender.
+                # Passing these only to OpenAIServingChat leaves the renderer
+                # at enable_auto_tools=False and rejects every OpenCode request
+                # before generation.
+                **openai_kwargs,
             )
         except ImportError:
             openai_serving_render = None
