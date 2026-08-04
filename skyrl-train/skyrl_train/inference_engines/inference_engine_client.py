@@ -1172,7 +1172,12 @@ def _parse_partial_response_and_inplace_update_accum(
     choice = partial_response["choices"][0]
     finish_reason: str = choice["finish_reason"]
     stop_reason: Optional[str] = choice.get("stop_reason", None)
-    new_content: str = choice["message"]["content"]
+    # `content` is nullable in the OpenAI schema: a non-retryable rejection (e.g. vLLM
+    # returning 400 for an over-long prompt) yields a choice whose message content is
+    # None, and `accum.content += None` raised TypeError, turning a clean rejection into
+    # an opaque 500 from the /chat/completions handler. Coerce to "" — token_ids and
+    # logprobs below still accumulate normally.
+    new_content: str = choice["message"]["content"] or ""
 
     assert (
         partial_response["usage"] is not None and partial_response["usage"]["completion_tokens"] is not None
