@@ -26,7 +26,13 @@ from skyrl_train.distributed.cp_utils import (
     cp_sdpa_dispatcher_span,
     cp_load_balance_indices,
 )
-from skyrl_train.utils.torch_utils import chunked_entropy_from_logits, logprobs_from_logits
+from skyrl_train.utils.torch_utils import (
+    chunked_entropy_from_logits,
+    chunked_logprobs_chunk_size,
+    chunked_logprobs_enabled,
+    chunked_logprobs_from_logits,
+    logprobs_from_logits,
+)
 from packaging.version import Version
 
 # --- Stage 2 (FSDP2 CP): guarded flash-attn import ---------------------------
@@ -1049,11 +1055,26 @@ class HFModelWrapper(nn.Module):
         # Under CP `logits_BSV` is sequence-sharded `[B, S/cp, V]` and
         # `sequences_rolled` was co-sharded by the SAME zigzag balancer, so this
         # per-token compute is token-for-token aligned on the local shard.
-        log_probs = logprobs_from_logits(
-            logits_BSV,
-            sequences_rolled,
-            inplace_backward=True,
-        )
+        # Large-vocab backward OOM guard. The stock path runs one fp32-promoted
+        # `log_softmax` over the whole [S, V]; at S=33K / V=248K that is a
+        # ~30.6 GiB grad allocation. Off by default so the stock path stays
+        # byte-identical; logged once when it engages so it can be confirmed
+        # from the run log rather than from the config.
+        if chunked_logprobs_enabled():
+            if not getattr(type(self), "_chunked_logprobs_logged", False):
+                type(self)._chunked_logprobs_logged = True
+                logger.info(
+                    "[logprobs] chunked gathered log-softmax ACTIVE "
+                    f"(chunk={chunked_logprobs_chunk_size()}, vocab={logits_BSV.size(-1)}, "
+                    f"seq={logits_BSV.size(-2)})"
+                )
+            log_probs = chunked_logprobs_from_logits(logits_BSV, sequences_rolled)
+        else:
+            log_probs = logprobs_from_logits(
+                logits_BSV,
+                sequences_rolled,
+                inplace_backward=True,
+            )
 
         # Stage 5 (FSDP2 CP) — THE correctness seam: unshard the per-token
         # `[B, S/cp]` logprobs back to natural-order `[B, S]` via the inverse of

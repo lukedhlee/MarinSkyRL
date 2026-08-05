@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from contextlib import nullcontext
+import os
 import torch
 import torch.nn.functional as F
 from jaxtyping import Float, Integer
@@ -28,6 +29,91 @@ except ImportError:
 
 
 CHUNK_SIZE = 1024
+
+
+def chunked_logprobs_enabled() -> bool:
+    """Whether to use the memory-efficient gathered log-softmax (default: off).
+
+    Read at call time from ``SKYRL_CHUNKED_LOGPROBS`` so it can be verified by
+    behaviour (the call site logs once when it engages) rather than by the
+    presence of a key in a materialized config.
+    """
+    return os.environ.get("SKYRL_CHUNKED_LOGPROBS", "0").lower() in {"1", "true", "yes"}
+
+
+def chunked_logprobs_chunk_size() -> int:
+    try:
+        return max(1, int(os.environ.get("SKYRL_CHUNKED_LOGPROBS_CHUNK", CHUNK_SIZE)))
+    except ValueError:
+        return CHUNK_SIZE
+
+
+class _ChunkedGatherLogProbs(torch.autograd.Function):
+    """Gathered log-softmax that recomputes in backward instead of saving it.
+
+    ``logprobs_from_logits_v2`` loops over the BATCH dim to bound memory, which
+    is a no-op at ``micro_train_batch_size_per_gpu=1``: it runs one
+    ``F.log_softmax`` over the whole ``[S, V]``. Under autocast that op is
+    promoted to fp32, so for a 33K-token sequence against a 248K vocab the
+    saved output is ~15 GiB and ``_log_softmax_backward_data`` then tries to
+    allocate a ~30.6 GiB fp32 grad -- the OOM that killed job 1229649.
+
+    Chunking alone does NOT fix it: ``log_softmax`` saves its output for
+    backward, so every chunk's output stays live and peak memory is unchanged.
+    This mirrors ``_EntropyFromLogits`` instead -- save only the logits (already
+    resident as the lm_head output) and recompute the softmax per chunk in
+    backward, so the fp32 working set is bounded by ``chunk_size * V``.
+
+    Forward:  f_t = x[t, y_t] - logsumexp(x[t])
+    Backward: df/dx[t, j] = (1{j == y_t} - p[t, j]) * grad_out[t]
+    """
+
+    @staticmethod
+    def forward(ctx, logits, labels, chunk_size):
+        ctx.save_for_backward(logits, labels)
+        ctx.chunk_size = chunk_size
+        seq_len = logits.size(-2)
+        out = torch.empty(labels.shape, dtype=torch.float32, device=logits.device)
+        # Explicit fp32 throughout; disable autocast so the dtype is ours, not
+        # the surrounding autocast region's.
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            for start in range(0, seq_len, chunk_size):
+                stop = min(start + chunk_size, seq_len)
+                chunk = logits[..., start:stop, :].float()
+                idx = labels[..., start:stop].unsqueeze(-1)
+                gathered = chunk.gather(-1, idx).squeeze(-1)
+                out[..., start:stop] = gathered - torch.logsumexp(chunk, dim=-1)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        logits, labels = ctx.saved_tensors
+        chunk_size = ctx.chunk_size
+        seq_len = logits.size(-2)
+        grad_logits = torch.empty_like(logits)
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            for start in range(0, seq_len, chunk_size):
+                stop = min(start + chunk_size, seq_len)
+                chunk = logits[..., start:stop, :].float()
+                probs = torch.softmax(chunk, dim=-1)
+                idx = labels[..., start:stop].unsqueeze(-1)
+                # probs - onehot, in place, so no extra [L, V] allocation
+                probs.scatter_add_(-1, idx, torch.full_like(idx, -1.0, dtype=probs.dtype))
+                # grad = grad_out * (onehot - probs) = -grad_out * (probs - onehot)
+                probs.mul_(-grad_out[..., start:stop].unsqueeze(-1).float())
+                grad_logits[..., start:stop, :] = probs.to(grad_logits.dtype)
+        return grad_logits, None, None
+
+
+def chunked_logprobs_from_logits(
+    logits: Float[torch.Tensor, "batch_size seqlen vocab_size"],
+    labels: Integer[torch.Tensor, "batch_size seqlen"],
+    chunk_size: int | None = None,
+) -> Float[torch.Tensor, "batch_size seqlen"]:
+    """Memory-efficient drop-in for :func:`logprobs_from_logits`. Returns fp32."""
+    return _ChunkedGatherLogProbs.apply(
+        logits, labels, chunk_size or chunked_logprobs_chunk_size()
+    )
 
 
 class _EntropyFromLogits(torch.autograd.Function):
