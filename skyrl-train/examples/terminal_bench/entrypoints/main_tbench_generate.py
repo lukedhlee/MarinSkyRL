@@ -92,8 +92,18 @@ class TerminalBenchGenerateExp(BasePPOExp):
             f"= {len(input_batch['prompts'])} trials"
         )
 
-        # Start generation
-        asyncio.run(generator.generate(input_batch))
+        # Start generation. startup() creates the shared QueueOrchestrator +
+        # its lock — the trainer path calls it once before the first generate();
+        # without it generate() dies at `async with self._orchestrator_lock`
+        # (None). shutdown() flushes/stops the orchestrator cleanly.
+        async def _generate():
+            await generator.startup()
+            try:
+                await generator.generate(input_batch)
+            finally:
+                await generator.shutdown()
+
+        asyncio.run(_generate())
 
 
 @ray.remote(num_cpus=1, max_retries=0)
