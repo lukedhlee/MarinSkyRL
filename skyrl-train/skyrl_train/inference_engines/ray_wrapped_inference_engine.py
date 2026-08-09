@@ -1,3 +1,5 @@
+import os
+
 import ray
 from loguru import logger
 from packaging import version
@@ -566,6 +568,26 @@ def create_ray_wrapped_inference_engines(
                     **rope_engine_kwargs,
                 )
                 inference_engine_actors.append(engine)
+
+            # SKYRL_ENGINE_INIT_BATCH=N: after every N engines spawned, block
+            # until their vLLM constructors complete before spawning the next
+            # batch. Ray serializes calls per actor, so the first user method
+            # (tp_size) returns only once __init__ finishes — including the
+            # internal TP NCCL/TCPStore bringup that contends across engines at
+            # 8+ nodes. Default 0 = current parallel-init behavior unchanged.
+            # (Ported from marianna13/SkyRL b07f04a; complements the
+            # report_engine_hosts readiness gate below, which only waits at the
+            # END — this throttles CONCURRENT construction.)
+            _engine_init_batch = int(os.environ.get("SKYRL_ENGINE_INIT_BATCH", "0"))
+            if _engine_init_batch > 0 and (i + 1) % _engine_init_batch == 0:
+                pending = inference_engine_actors[-_engine_init_batch * data_parallel_size :]
+                logger.info(
+                    f"[engine init batch] waiting on engines "
+                    f"{i + 1 - _engine_init_batch}..{i} __init__ to complete "
+                    f"({len(pending)} actor(s))"
+                )
+                ray.get([a.tp_size.remote() for a in pending])
+                logger.info(f"[engine init batch] engines {i + 1 - _engine_init_batch}..{i} ready")
         elif backend == "sglang":
             # NOTE: there is no async / sync engine distinction in SGLang
 
@@ -628,6 +650,18 @@ def create_ray_wrapped_inference_engines(
             engine = ray.get(get_sglang_engine.remote())
 
             inference_engine_actors.append(engine)
+
+    # Flush any engines past the last SKYRL_ENGINE_INIT_BATCH boundary so all
+    # constructors complete before we hand the engines back. No-op when the
+    # knob is off — the readiness gate / sleep barrier below already forces
+    # materialization in that case.
+    _engine_init_batch = int(os.environ.get("SKYRL_ENGINE_INIT_BATCH", "0"))
+    if _engine_init_batch > 0 and backend == "vllm":
+        remainder = num_inference_engines % _engine_init_batch
+        if remainder:
+            tail = inference_engine_actors[-remainder * data_parallel_size :]
+            logger.info(f"[engine init batch] flushing final {len(tail)} actor(s)")
+            ray.get([a.tp_size.remote() for a in tail])
 
     engines = [RayWrappedInferenceEngine(actor_handle) for actor_handle in inference_engine_actors]
 
