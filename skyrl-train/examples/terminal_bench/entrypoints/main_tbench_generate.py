@@ -19,7 +19,8 @@ from skyrl_train.entrypoints.main_base import (
     BasePPOExp,
     config_dir,
 )
-from skyrl_train.generators.base import GeneratorInput
+from skyrl_train.generators.utils import prepare_generator_input
+from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
 from examples.terminal_bench.terminal_bench_generator import TerminalBenchGenerator
 from examples.terminal_bench.dataset import TerminalBenchTaskDataset
 
@@ -72,12 +73,23 @@ class TerminalBenchGenerateExp(BasePPOExp):
     def run(self):
         generator = self._setup_generator()
 
-        # Build input from the training dataset
-        input_batch = GeneratorInput(
-            prompts=[item["prompt"] for item in self.train_dataset],
-            env_classes=None,
-            env_extras=None,
-            sampling_params=None,
+        # Build input from the training dataset via the SAME builder the trainer
+        # uses (generators/utils.py): expands each task ×n_samples_per_prompt
+        # (p@k) and attaches the trajectory_ids / batch_metadata the generator's
+        # generate() requires — the hand-rolled GeneratorInput this replaces
+        # provided neither (KeyError: 'trajectory_ids', and no p@k expansion).
+        items = [self.train_dataset[i] for i in range(len(self.train_dataset))]
+        input_batch, _ = prepare_generator_input(
+            items,
+            self.cfg.generator.n_samples_per_prompt,
+            get_sampling_params_for_backend(self.cfg.generator.backend, self.cfg.generator.sampling_params),
+            self.cfg.environment.env_class,
+            "train",
+            0,
+        )
+        logger.info(
+            f"generate input: {len(items)} tasks x {self.cfg.generator.n_samples_per_prompt} samples "
+            f"= {len(input_batch['prompts'])} trials"
         )
 
         # Start generation
