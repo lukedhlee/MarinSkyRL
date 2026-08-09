@@ -2,6 +2,7 @@
 Main entrypoint for generating rollouts on terminal bench tasks.
 """
 
+import os
 import signal
 import sys
 import ray
@@ -71,6 +72,24 @@ class TerminalBenchGenerateExp(BasePPOExp):
         return prompts_dataset
 
     def run(self):
+        # Externally routed inference endpoint (bridge/sandbox deployments):
+        # sandboxes on the CPU fleet reach the engines via a reverse forward
+        # (e.g. 10.14.0.46:<port> -> head:8000), not via the head's loopback.
+        # The trainer's fan-out path (RolloutDispatcher) applies this exact
+        # override; without it the generator writes baseURL 127.0.0.1:8000
+        # into every sandbox's agent config and the agents call THEMSELVES —
+        # zero requests ever reach the engines (smoke 1293267).
+        rollout_host = os.environ.get("SKYRL_ROLLOUT_HTTP_ENDPOINT_HOST")
+        rollout_port = os.environ.get("SKYRL_ROLLOUT_HTTP_ENDPOINT_PORT")
+        if rollout_host:
+            self.cfg.generator.http_endpoint_host = rollout_host
+            if rollout_port:
+                self.cfg.generator.http_endpoint_port = int(rollout_port)
+            logger.info(
+                f"generate: using externally routed inference endpoint "
+                f"{rollout_host}:{self.cfg.generator.http_endpoint_port}"
+            )
+
         generator = self._setup_generator()
 
         # Build input from the training dataset via the SAME builder the trainer
