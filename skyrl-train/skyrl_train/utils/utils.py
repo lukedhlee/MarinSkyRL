@@ -1219,6 +1219,17 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
         logger.info("Exporting wandb api key to ray runtime env")
         env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
 
+    # Forward offline/dir settings into Ray actors (compute nodes have no internet).
+    for _wandb_env in ("WANDB_MODE", "WANDB_DIR", "WANDB_PROJECT", "WANDB_ENTITY"):
+        if os.environ.get(_wandb_env):
+            logger.info(f"Exporting `{_wandb_env}` to ray runtime env: {os.environ[_wandb_env]}")
+            env_vars[_wandb_env] = os.environ[_wandb_env]
+
+    # vLLM wheels need nvidia-* pip CUDA 12 libs; Ray actors only see runtime_env.
+    if os.environ.get("LD_LIBRARY_PATH"):
+        logger.info("Exporting LD_LIBRARY_PATH to ray runtime env")
+        env_vars["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+
     if os.environ.get("MLFLOW_TRACKING_URI"):
         logger.info("Exporting mlflow tracking uri to ray runtime env")
         env_vars["MLFLOW_TRACKING_URI"] = os.environ["MLFLOW_TRACKING_URI"]
@@ -1258,6 +1269,8 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
         "NCCL_SOCKET_FAMILY",
         "NCCL_DEBUG",
         "NCCL_DEBUG_SUBSYS",
+        "GLOO_USE_IPV6",
+        "VLLM_FORCE_IPV4",
     ):
         if os.environ.get(_net_env):
             logger.info(f"Exporting `{_net_env}` to ray runtime env: {os.environ[_net_env]}")

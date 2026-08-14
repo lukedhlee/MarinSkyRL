@@ -150,7 +150,7 @@ class RayPPOTrainer:
         """
         self.train_dataloader = build_dataloader(self.cfg, self.train_dataset, is_train=True)
         self.total_training_steps = len(self.train_dataloader) * self.cfg.trainer.epochs
-        max_steps = getattr(self.cfg.trainer, "max_steps", None)
+        max_steps = getattr(self.cfg.trainer, 'max_steps', None)
         if max_steps is not None and max_steps > 0:
             self.total_training_steps = min(self.total_training_steps, max_steps)
 
@@ -299,14 +299,10 @@ class RayPPOTrainer:
                 label="HTTP endpoint shutdown",
             )
         await self._guarded_async(
-            self.generator.shutdown(),
-            timeout=60,
-            label="Generator shutdown",
+            self.generator.shutdown(), timeout=60, label="Generator shutdown",
         )
         await self._guarded_async(
-            self.inference_engine_client.teardown(),
-            timeout=30,
-            label="Inference engine teardown",
+            self.inference_engine_client.teardown(), timeout=30, label="Inference engine teardown",
         )
         self._guarded_sync(self._kill_ray_actors, label="Ray actor cleanup")
 
@@ -323,7 +319,10 @@ class RayPPOTrainer:
         """Start a daemon thread that force-exits the process after *timeout* seconds."""
 
         def _force_exit():
-            logger.error(f"Process still alive {timeout}s after teardown — forcing exit to prevent zombie process")
+            logger.error(
+                f"Process still alive {timeout}s after teardown — "
+                "forcing exit to prevent zombie process"
+            )
             os._exit(1)
 
         t = threading.Timer(timeout, _force_exit)
@@ -414,7 +413,10 @@ class RayPPOTrainer:
                 return
 
         if self.colocate_all:
-            self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
+            # Offload model too: colocated vLLM (~60GB for 30B-A3B) + FSDP shard leaves
+            # no HBM for DTensor all_gather in broadcast_to_inference_engines (Vista 843025).
+            # extract_weights moves params to GPU one-at-a-time; matches 80B Stage-7 pattern.
+            self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=True)
             await self.inference_engine_client.wake_up(tags=["weights"])
         with Timer("sync_weights"):
             ray.get(self.sync_policy_weights_to_inference_engines())
@@ -509,12 +511,10 @@ class RayPPOTrainer:
                         batch_skipped = float(getattr(self, "_tis_batch_skipped_no_logprobs", 0.0))
                         self._tis_skipped_count = getattr(self, "_tis_skipped_count", 0.0) + batch_skipped
                         self._tis_total_count = getattr(self, "_tis_total_count", 0.0) + 1.0
-                        self.all_metrics.update(
-                            {
-                                "tis/batch_skipped_no_logprobs": batch_skipped,
-                                "tis/skipped_fraction": self._tis_skipped_count / self._tis_total_count,
-                            }
-                        )
+                        self.all_metrics.update({
+                            "tis/batch_skipped_no_logprobs": batch_skipped,
+                            "tis/skipped_fraction": self._tis_skipped_count / self._tis_total_count,
+                        })
 
                     # 1.4 inference and calculate values, log probs, rewards, kl divergence
                     with Timer("fwd_logprobs_values_reward", self.all_timings):
@@ -548,7 +548,7 @@ class RayPPOTrainer:
 
                     # 5. sync weights to inference engines (must happen before callbacks)
                     if self.colocate_all:
-                        self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
+                        self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=True)
                         await self.inference_engine_client.wake_up(tags=["weights"])
                     with Timer("sync_weights", self.all_timings):
                         ray.get(self.sync_policy_weights_to_inference_engines())
@@ -562,8 +562,8 @@ class RayPPOTrainer:
                 self.all_metrics.update({"trainer/epoch": epoch, "trainer/global_step": self.global_step})
 
                 # 7. Create trainer state and call on_step_end callbacks
-                is_epoch_end = iter == len(self.train_dataloader) - 1
-                is_last_step = self.global_step == self.total_training_steps
+                is_epoch_end = (iter == len(self.train_dataloader) - 1)
+                is_last_step = (self.global_step == self.total_training_steps)
                 step_state = TrainerState(
                     global_step=self.global_step,
                     epoch=epoch,
@@ -587,7 +587,9 @@ class RayPPOTrainer:
                     with Timer("save_checkpoints", self.all_timings):
                         self.save_checkpoints()
                     # Call on_save callbacks
-                    await self.callback_handler.call_event_async("on_save", step_state, self._control, trainer=self)
+                    await self.callback_handler.call_event_async(
+                        "on_save", step_state, self._control, trainer=self
+                    )
                     self._control.should_save = False
 
                 # Handle HF model saving
@@ -727,9 +729,9 @@ class RayPPOTrainer:
                 * cfg.generator.inference_engine_pipeline_parallel_size
                 * cfg.generator.inference_engine_data_parallel_size
             )
-            assert num_policy_gpus == num_rollout_gpus, (
-                "num_policy_gpus and num_rollout_gpus must be the same when colocating all models"
-            )
+            assert (
+                num_policy_gpus == num_rollout_gpus
+            ), "num_policy_gpus and num_rollout_gpus must be the same when colocating all models"
             pg = self.colocate_pg
 
             policy_model = PPORayActorGroup(
@@ -744,9 +746,9 @@ class RayPPOTrainer:
                 record_memory=cfg.trainer.policy.record_memory,
             )
             if use_ref_model:
-                assert num_policy_gpus == num_ref_gpus, (
-                    "num_policy_gpus and num_ref_gpus must be the same when colocating policy and ref model"
-                )
+                assert (
+                    num_policy_gpus == num_ref_gpus
+                ), "num_policy_gpus and num_ref_gpus must be the same when colocating policy and ref model"
                 ref_model = PPORayActorGroup(
                     cfg,
                     cfg.trainer.placement.ref_num_nodes,
@@ -761,9 +763,9 @@ class RayPPOTrainer:
                 ref_model = None
 
             if cfg.trainer.critic.model.path:
-                assert num_policy_gpus == num_critic_gpus, (
-                    "num_policy_gpus and num_critic_gpus must be the same when colocating policy and critic model"
-                )
+                assert (
+                    num_policy_gpus == num_critic_gpus
+                ), "num_policy_gpus and num_critic_gpus must be the same when colocating policy and critic model"
                 critic_model = PPORayActorGroup(
                     cfg,
                     cfg.trainer.placement.critic_num_nodes,
@@ -920,7 +922,9 @@ class RayPPOTrainer:
                 )
             )
         except ray.exceptions.RayError as e:
-            raise RuntimeError(f"init_weight_sync_state failed at Ray boundary: {e!r}") from None
+            raise RuntimeError(
+                f"init_weight_sync_state failed at Ray boundary: {e!r}"
+            ) from None
         logger.info("Initialized weight sync state for policy model and inference engines.")
 
     def _resolve_num_experts(self) -> Optional[int]:
@@ -979,8 +983,12 @@ class RayPPOTrainer:
         # MoE router-replay capture rail (Stage 1): only pull routed_experts when
         # the flag is on. Gated so the flag-off TrainingInputBatch is byte-identical
         # (the field is never even passed to the collator nor set on the batch).
-        moe_router_replay = bool(self.cfg.trainer.policy.fsdp_config.get("moe_router_replay", False))
-        routed_experts = generator_output.get("rollout_routed_experts", None) if moe_router_replay else None
+        moe_router_replay = bool(
+            self.cfg.trainer.policy.fsdp_config.get("moe_router_replay", False)
+        )
+        routed_experts = (
+            generator_output.get("rollout_routed_experts", None) if moe_router_replay else None
+        )
         # Deterministic dtype for the rollout_routed_experts transport tensor:
         # resolve the model's expert count once (memoized) and pass it to the
         # collator so the narrowed dtype is keyed on num_experts (max possible id),
@@ -993,9 +1001,15 @@ class RayPPOTrainer:
         # shaping channel + span tags when the channel is enabled. Gated so the
         # flag-off TrainingInputBatch is byte-identical (the fields are never passed
         # to the collator nor set on the batch). Mirrors moe_router_replay above.
-        enable_token_reward_channel = bool(self.cfg.trainer.algorithm.get("enable_token_reward_channel", False))
-        token_level_shaping = generator_output.get("token_level_shaping", None) if enable_token_reward_channel else None
-        response_span_tags = generator_output.get("response_span_tags", None) if enable_token_reward_channel else None
+        enable_token_reward_channel = bool(
+            self.cfg.trainer.algorithm.get("enable_token_reward_channel", False)
+        )
+        token_level_shaping = (
+            generator_output.get("token_level_shaping", None) if enable_token_reward_channel else None
+        )
+        response_span_tags = (
+            generator_output.get("response_span_tags", None) if enable_token_reward_channel else None
+        )
 
         (
             sequences_tensor,
@@ -1049,12 +1063,14 @@ class RayPPOTrainer:
                     "logprobs); a low/intermittent rate is context-length errors."
                 )
             else:
-                assert rollout_logprobs_tensor.shape == loss_masks_tensor.shape, "Logprobs should look like responses"
+                assert (
+                    rollout_logprobs_tensor.shape == loss_masks_tensor.shape
+                ), "Logprobs should look like responses"
         # Stage 1 invariant (scope Q3 #2): routed_experts.shape[:2] == loss_mask.shape.
         if rollout_routed_experts_tensor is not None:
-            assert rollout_routed_experts_tensor.shape[:2] == loss_masks_tensor.shape, (
-                "routed_experts response axis should look like responses"
-            )
+            assert (
+                rollout_routed_experts_tensor.shape[:2] == loss_masks_tensor.shape
+            ), "routed_experts response axis should look like responses"
         training_input = TrainingInputBatch(
             {
                 "sequences": sequences_tensor,  # Full trajectories (padded and concatenated prompts and responses)
@@ -1090,9 +1106,9 @@ class RayPPOTrainer:
         # padded response length
         training_input.metadata["response_length"] = response_masks_tensor.shape[1]
         if self.cfg.trainer.step_wise_training:
-            assert "trajectory_ids" in generator_output, (
-                "Expected `trajectory_ids` in generator output for step wise training"
-            )
+            assert (
+                "trajectory_ids" in generator_output
+            ), "Expected `trajectory_ids` in generator output for step wise training"
             training_input.metadata["trajectory_ids"] = [
                 trajectory_id.to_string() for trajectory_id in generator_output["trajectory_ids"]
             ]
@@ -1252,9 +1268,9 @@ class RayPPOTrainer:
                 torch.cat([torch.tensor([False], device=is_last_step.device), is_last_step[:-1]]).int().cumsum(dim=0)
             )
             num_groups = traj_ids[-1].item() + 1
-            assert num_groups == len(last_step_advantages), (
-                f"number of groups {num_groups} doesn't match the number of trajectories as given by `is_last_step` {len(last_step_advantages)}. The `is_last_step` tensor is likely malformed"
-            )
+            assert num_groups == len(
+                last_step_advantages
+            ), f"number of groups {num_groups} doesn't match the number of trajectories as given by `is_last_step` {len(last_step_advantages)}. The `is_last_step` tensor is likely malformed"
             advantages = last_step_advantages[traj_ids]
             returns = last_step_returns[traj_ids]
         else:
@@ -1371,7 +1387,9 @@ class RayPPOTrainer:
             if key not in ["uids", "trajectory_ids"]:
                 # Extend numpy bool arrays so they stay aligned with the padded batch
                 if key == "exclude_from_baseline" and isinstance(value, np.ndarray):
-                    new_training_input.metadata[key] = np.concatenate([value, np.ones(pad_size, dtype=value.dtype)])
+                    new_training_input.metadata[key] = np.concatenate(
+                        [value, np.ones(pad_size, dtype=value.dtype)]
+                    )
                 else:
                     new_training_input.metadata[key] = copy.deepcopy(value)
         return new_training_input
@@ -1498,7 +1516,10 @@ class RayPPOTrainer:
         training_input["action_log_probs"] = action_log_probs
         training_input["values"] = values
 
-        if self.cfg.generator.sampling_params.logprobs is not None and training_input["rollout_logprobs"] is not None:
+        if (
+            self.cfg.generator.sampling_params.logprobs is not None
+            and training_input["rollout_logprobs"] is not None
+        ):
             # calculates the difference in probs between inference and trainer components
             # only consider response tokens.
             # NOTE (Fix A-extend, 2026-06-07): rollout_logprobs can be None for a
@@ -1530,12 +1551,10 @@ class RayPPOTrainer:
             )
             _kl_mean = masked_mean(_kl, training_input["loss_mask"], dim=-1).mean().item()
             _kl_max = torch.max(_kl.abs(), dim=-1)[0].mean().item()
-            self.all_metrics.update(
-                {
-                    "reward/policy_ref_kl": _kl_mean,
-                    "reward/policy_ref_kl_max": _kl_max,
-                }
-            )
+            self.all_metrics.update({
+                "reward/policy_ref_kl": _kl_mean,
+                "reward/policy_ref_kl_max": _kl_max,
+            })
 
         return training_input
 
@@ -1746,6 +1765,8 @@ class RayPPOTrainer:
         global_step_folder = os.path.join(self.cfg.trainer.ckpt_path, f"global_step_{self.global_step}")
         policy_save_dir = os.path.join(global_step_folder, "policy")
         critic_save_dir = os.path.join(global_step_folder, "critic")
+        save_optimizer_states = bool(getattr(self.cfg.trainer, "save_optimizer_states", True))
+        save_lr_scheduler_states = bool(getattr(self.cfg.trainer, "save_lr_scheduler_states", True))
 
         io.makedirs(global_step_folder, exist_ok=True)
 
@@ -1756,6 +1777,8 @@ class RayPPOTrainer:
                 "save_checkpoint",
                 ckpt_dir=policy_save_dir,
                 tokenizer=self.tokenizer,
+                save_optimizer_states=save_optimizer_states,
+                save_lr_scheduler_states=save_lr_scheduler_states,
             )
         )
 
@@ -1771,6 +1794,8 @@ class RayPPOTrainer:
                     "save_checkpoint",
                     ckpt_dir=critic_save_dir,
                     tokenizer=self.tokenizer,
+                    save_optimizer_states=save_optimizer_states,
+                    save_lr_scheduler_states=save_lr_scheduler_states,
                 )
             )
 
@@ -1913,13 +1938,15 @@ class RayPPOTrainer:
 
         # 3. Load policy checkpoint
         logger.info(f"Loading policy checkpoint from {policy_ckpt_dir}")
+        load_optimizer_states = bool(getattr(self.cfg.trainer, "load_optimizer_states", True))
+        load_lr_scheduler_states = bool(getattr(self.cfg.trainer, "load_lr_scheduler_states", True))
         _ = ray.get(
             self.policy_model.async_run_ray_method(
                 "pass_through",
                 "load_checkpoint",
                 ckpt_dir=policy_ckpt_dir,
-                load_optimizer_states=True,
-                load_lr_scheduler_states=True,
+                load_optimizer_states=load_optimizer_states,
+                load_lr_scheduler_states=load_lr_scheduler_states,
             )
         )
         logger.info("Successfully loaded policy checkpoint")
@@ -1932,8 +1959,8 @@ class RayPPOTrainer:
                     "pass_through",
                     "load_checkpoint",
                     ckpt_dir=critic_ckpt_dir,
-                    load_optimizer_states=True,
-                    load_lr_scheduler_states=True,
+                    load_optimizer_states=load_optimizer_states,
+                    load_lr_scheduler_states=load_lr_scheduler_states,
                 )
             )
             logger.info("Successfully loaded critic checkpoint")
@@ -1960,7 +1987,6 @@ class RayPPOTrainer:
 
     def _log_metrics_stdout(self, payload: Dict[str, Any], step: int, kind: str = "train") -> None:
         """Mirror the wandb/tracker payload to stdout so metrics are recoverable without wandb access."""
-
         def _coerce(v):
             try:
                 if isinstance(v, (int, float, bool, str)) or v is None:
@@ -1970,7 +1996,6 @@ class RayPPOTrainer:
                 return float(v)
             except Exception:
                 return str(v)
-
         try:
             serialised = json.dumps({k: _coerce(v) for k, v in payload.items()}, sort_keys=True)
         except Exception as e:

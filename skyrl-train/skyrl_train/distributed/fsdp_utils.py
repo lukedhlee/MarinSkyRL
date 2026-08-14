@@ -349,7 +349,10 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             # Match on the placement TYPE so _StridedShard._split_tensor (which honors
             # the strided layout, as the docstring already intends) actually runs.
             from torch.distributed.tensor.placement_types import Shard
-            from torch.distributed.tensor._dtensor_spec import _StridedShard
+            try:
+                from torch.distributed.tensor.placement_types import _StridedShard
+            except ImportError:  # pragma: no cover
+                from torch.distributed.tensor._dtensor_spec import _StridedShard
 
             mesh = dtensor_meta.device_mesh
             placements = dtensor_meta.placements
@@ -731,7 +734,10 @@ def apply_ep(model, device_mesh, ep_comm_backend="torch", sequence_parallel_size
                 # torch 2.11 — a quirk, NOT an EP-only 1-D leak. Accept it explicitly
                 # so the (_StridedShard(fsdp), Shard(ep)) 2-D composition validates.
                 from torch.distributed.tensor.placement_types import Shard
-                from torch.distributed.tensor._dtensor_spec import _StridedShard
+                try:
+                    from torch.distributed.tensor.placement_types import _StridedShard
+                except ImportError:  # pragma: no cover
+                    from torch.distributed.tensor._dtensor_spec import _StridedShard
 
                 for _pn, _p in experts.named_parameters(recurse=False):
                     _pls = getattr(_p, "placements", ())

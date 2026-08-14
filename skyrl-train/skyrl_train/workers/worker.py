@@ -3,6 +3,7 @@ import contextlib
 import logging
 import os
 import socket
+from datetime import timedelta
 from typing import Dict, Optional, Type, List, Any, Callable
 from skyrl_train.utils.progress import tqdm
 from collections import defaultdict
@@ -16,10 +17,15 @@ import torch.distributed
 from ray import ObjectRef
 from ray.util.placement_group import (
     PlacementGroup,
-    PlacementGroupSchedulingStrategy,
     placement_group,
     placement_group_table,
 )
+
+try:
+    # Ray < 2.55
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
+except ImportError:  # Ray >= 2.55
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from skyrl_train.utils import ray_noset_visible_devices, get_ray_pg_ready_with_timeout, get_reordered_bundle_indices
 from skyrl_train.utils.constants import SKYRL_RAY_PG_TIMEOUT_IN_S, SKYRL_WORKER_NCCL_TIMEOUT_IN_S
@@ -30,7 +36,7 @@ from skyrl_train.distributed.strategy import DistributedStrategy
 from transformers import PreTrainedModel
 from loguru import logger
 from skyrl_train.distributed.ulysses import set_ulysses_sequence_parallel_group, apply_monkey_patch
-from skyrl_train.distributed.utils import init_custom_process_group, init_worker_process_group_with_device
+from skyrl_train.distributed.utils import init_custom_process_group
 from skyrl_train.utils.ppo_utils import (
     PolicyLossRegistry,
     ppo_critic_loss,
@@ -44,6 +50,7 @@ from skyrl_train.inference_engines.inference_engine_client import InferenceEngin
 from skyrl_train.utils.utils import configure_ray_worker_logging, get_tcp_url
 from omegaconf import DictConfig
 from pathlib import Path
+
 
 
 # Adapted from OpenRLHF: https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/trainer/ray/launcher.py#L17
@@ -148,10 +155,11 @@ class DistributedTorchRayActor:
         return self._local_rank
 
     def init_worker_process_group(self):
-        # Device-pinned NCCL PG init via the shared helper — pins set_device(LOCAL_RANK) and
-        # passes device_id so ProcessGroupNCCL never guesses the device (fixes the cw-rno2a
-        # unmasked-CVD collective deadlock; see init_worker_process_group_with_device).
-        init_worker_process_group_with_device(timeout_seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
+        if not torch.distributed.is_initialized():
+            # Default torch dist pg init timeout is 10 minutes (600 seconds)
+            torch.distributed.init_process_group(
+                backend="nccl", timeout=timedelta(seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
+            )
 
         # setup device mesh
         # TODO: Support TP / PP for DeepSpeed
@@ -271,7 +279,6 @@ class DistributedTorchRayActor:
     def _get_current_node_ip():
         # Debug: understand where the IP comes from
         import socket
-
         hostname = socket.gethostname()
 
         # Check if Ray has a global node set
@@ -323,7 +330,6 @@ class DistributedTorchRayActor:
         """
         try:
             from skyrl_train.utils.numa import set_numa_affinity_for_gpu
-
             cuda_devs = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
             if cuda_devs[0]:
                 gpu_id = int(cuda_devs[rank])
@@ -451,7 +457,6 @@ class Worker(DistributedTorchRayActor):
         if torch.distributed.get_rank() == 0:
             # Debug: understand where master_addr comes from
             import socket as sock_module
-
             hostname = sock_module.gethostname()
             global_node = ray._private.worker._global_node
             global_node_ip = global_node.node_ip_address if global_node else "None"
@@ -542,7 +547,8 @@ class Worker(DistributedTorchRayActor):
         if "rollout_routed_experts" in data.keys() and data["rollout_routed_experts"] is not None:
             _r3 = data["rollout_routed_experts"]
             logger.info(
-                f"R3_RESIDENT_SET rank={self._rank} nbytes={int(_r3.nbytes)} dtype={_r3.dtype} shape={tuple(_r3.shape)}"
+                f"R3_RESIDENT_SET rank={self._rank} nbytes={int(_r3.nbytes)} "
+                f"dtype={_r3.dtype} shape={tuple(_r3.shape)}"
             )
         # run in micro batches of cfg.trainer.micro_forward_batch_size_per_gpu
         # TODO (sumanthrh): this can be in the policy/critic impl if the micro batch size can be specific to policy, critic, etc.
@@ -679,13 +685,13 @@ class PPORayActorGroup:
         """
         world_size = self._num_nodes * self._num_gpus_per_node
         if self.colocate_all:
-            assert pg is not None, (
-                "if colocate_all is True, the shared placement group must be provided to PPORayActorGroup"
-            )
+            assert (
+                pg is not None
+            ), "if colocate_all is True, the shared placement group must be provided to PPORayActorGroup"
             pg_data = placement_group_table(pg)
-            assert len(pg_data["bundles"]) == world_size, (
-                "if colocate_all is True, the number of bundles in the shared placement group must match the world size"
-            )
+            assert (
+                len(pg_data["bundles"]) == world_size
+            ), "if colocate_all is True, the number of bundles in the shared placement group must match the world size"
 
         reordered_bundle_indices = []
         if pg is not None:
@@ -1018,7 +1024,9 @@ class PolicyWorkerBase(Worker):
                 else "adaptive_scaling",
                 clip_factor=getattr(zc_cfg, "clip_factor", 1.0) if zc_cfg is not None else 1.0,
                 mode=getattr(zc_cfg, "mode", "zscore") if zc_cfg is not None else "zscore",
-                skip_update_on_spike=getattr(zc_cfg, "skip_update_on_spike", False) if zc_cfg is not None else False,
+                skip_update_on_spike=getattr(zc_cfg, "skip_update_on_spike", False)
+                if zc_cfg is not None
+                else False,
                 enabled=getattr(zc_cfg, "enabled", False) if zc_cfg is not None else False,
             )
             # If load_checkpoint() stashed prior ZClip / StaleClip state from a
@@ -1184,7 +1192,9 @@ class PolicyWorkerBase(Worker):
         # which keep the unweighted 0/1 loss_mask (they measure the policy, not the
         # credit weighting).
         think_token_weight = float(getattr(self.cfg.trainer.algorithm, "think_token_weight", 1.0))
-        policy_loss_mask = build_think_weighted_loss_mask(loss_mask, response_span_tags, think_token_weight)
+        policy_loss_mask = build_think_weighted_loss_mask(
+            loss_mask, response_span_tags, think_token_weight
+        )
 
         # TODO (sumanthrh): don't think this does anything for deepspeed or fsdp rn because autocast happens internally
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
@@ -1312,7 +1322,6 @@ class PolicyWorkerBase(Worker):
             finalize_log_ratio_metrics,
             _log_ratio_diag_zero_metrics,
         )
-
         if local_step % accumulation_steps == 0 or getattr(self, "_ratio_diag_acc", None) is None:
             self._ratio_diag_acc = _empty_log_ratio_accumulator(device=action_log_probs.device)
         try:
@@ -1323,9 +1332,7 @@ class PolicyWorkerBase(Worker):
             )
             merge_log_ratio_partial(self._ratio_diag_acc, partial)
         except Exception as _e:
-            logger.warning(
-                f"compute_log_ratio_partial failed at local_step={local_step}: {_e!r}; skipping this micro-batch"
-            )
+            logger.warning(f"compute_log_ratio_partial failed at local_step={local_step}: {_e!r}; skipping this micro-batch")
 
         grad_norm = None
         ratio_diag = {}
@@ -1422,7 +1429,13 @@ class PolicyWorkerBase(Worker):
         status["response_length"] = num_actions
         return status
 
-    def save_checkpoint(self, ckpt_dir: Path, tokenizer=None):
+    def save_checkpoint(
+        self,
+        ckpt_dir: Path,
+        tokenizer=None,
+        save_optimizer_states: bool = True,
+        save_lr_scheduler_states: bool = True,
+    ):
         # Persist ZClip / StaleClip state alongside the model so warmup
         # counters and EMA stats survive chain-restarts. Without this,
         # warmup_buffer resets to [] on every resume and (with default
@@ -1436,8 +1449,8 @@ class PolicyWorkerBase(Worker):
                 client_state["stale_clip_state"] = sc_state
         self.strategy.save_checkpoint(
             model=self.model,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
+            optimizer=self.optimizer if save_optimizer_states else None,
+            scheduler=self.scheduler if save_lr_scheduler_states else None,
             ckpt_dir=ckpt_dir,
             node_local_rank=self.get_node_local_rank(),
             tokenizer=tokenizer,
@@ -1487,7 +1500,9 @@ class PolicyWorkerBase(Worker):
         # experts -> a pathological step-1 importance ratio. Absent key (8B /
         # router-replay off) -> None -> stock native forward, unchanged.
         rollout_routed_experts = (
-            micro_batch["rollout_routed_experts"] if "rollout_routed_experts" in micro_batch.keys() else None
+            micro_batch["rollout_routed_experts"]
+            if "rollout_routed_experts" in micro_batch.keys()
+            else None
         )
 
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
@@ -1660,11 +1675,17 @@ class CriticWorkerBase(Worker):
             status["raw_grad_norm"] = grad_norm
         return status
 
-    def save_checkpoint(self, ckpt_dir: str, tokenizer=None):
+    def save_checkpoint(
+        self,
+        ckpt_dir: str,
+        tokenizer=None,
+        save_optimizer_states: bool = True,
+        save_lr_scheduler_states: bool = True,
+    ):
         self.strategy.save_checkpoint(
             model=self.model,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
+            optimizer=self.optimizer if save_optimizer_states else None,
+            scheduler=self.scheduler if save_lr_scheduler_states else None,
             ckpt_dir=ckpt_dir,
             node_local_rank=self.get_node_local_rank(),
             tokenizer=tokenizer,
@@ -1698,7 +1719,9 @@ class RefWorkerBase(Worker):
         # are computed on the same forward path as the policy. Absent key -> None
         # -> stock native forward (8B / flag-off unchanged).
         rollout_routed_experts = (
-            micro_batch["rollout_routed_experts"] if "rollout_routed_experts" in micro_batch.keys() else None
+            micro_batch["rollout_routed_experts"]
+            if "rollout_routed_experts" in micro_batch.keys()
+            else None
         )
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             log_probs = self.model(
