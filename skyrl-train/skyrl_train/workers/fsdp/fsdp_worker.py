@@ -1141,6 +1141,11 @@ class FSDPRefWorkerBase(RefWorkerBase):
                 use_sample_packing=self.cfg.trainer.use_sample_packing,
                 rope_scaling=get_rope_scaling_config(self.cfg.trainer),
                 rope_theta=get_rope_theta_config(self.cfg.trainer),
+                # EP on the ref requires the same grouped-experts swap as the
+                # policy — _fsdp_init_model asserts num_sharded > 0 when
+                # expert_model_parallel_size > 1 and finds nothing without it.
+                moe_grouped_gemm=bool(self.cfg.trainer.ref.fsdp_config.get("moe_grouped_gemm", False)),
+                use_grouped_mm=bool(self.cfg.trainer.ref.fsdp_config.get("use_grouped_mm", False)),
                 attn_backend=self.cfg.trainer.get("attn_backend", "auto"),
                 context_parallel_size=int(self.cfg.trainer.ref.fsdp_config.get("context_parallel_size", 1)),
                 # Stage 4: ref-logprob forward must CP-shard identically to the
