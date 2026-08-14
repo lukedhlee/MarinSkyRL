@@ -28,6 +28,7 @@ from skyrl_train.generators.base import (
 )
 import copy
 from skyrl_train.generators.utils import get_metrics_from_generator_output, prepare_generator_input
+from skyrl_train.utils import diag_utils
 from skyrl_train.dataset.preprocess import (
     convert_prompts_responses_to_batch_tensors,
 )
@@ -1218,6 +1219,27 @@ class RayPPOTrainer:
             f"reward/avg_raw_reward: {mean_raw_reward} "
             f"(effective_batch={effective_samples} samples)"
         )
+
+        try:
+            if self.cfg.trainer.get("diag_group_metrics", False):
+                diag_metrics = diag_utils.compute_rollout_diagnostics(
+                    rewards=generator_output_for_metrics["rewards"],
+                    uids=uids_for_metrics,
+                    response_lengths=[len(r) for r in generator_output_for_metrics["response_ids"]],
+                    stop_reasons=generator_output_for_metrics.get("stop_reasons"),
+                    n_samples_per_prompt=n_samples_per_prompt,
+                )
+                self.all_metrics.update(diag_metrics)
+            if self.cfg.trainer.get("dump_train_rollouts", False):
+                diag_utils.dump_train_rollouts(
+                    generator_output,
+                    uids,
+                    self.tokenizer,
+                    self.cfg.trainer.export_path,
+                    self.global_step,
+                )
+        except Exception as e:
+            logger.warning(f"rollout diagnostics failed (non-fatal): {e}")
 
         # re-assign reward but now it's per token rewards
         generator_output["rewards"] = per_token_rewards
