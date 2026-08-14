@@ -32,6 +32,19 @@ from skyrl_train.weight_sync import WeightExtractor, WeightChunk
 from skyrl_train.weight_sync.weight_extractor_utils import yield_module_grouped_chunks
 
 
+def _fsdp_moe_model_kwargs(fsdp_config) -> dict[str, bool]:
+    """Translate one role's FSDP MoE settings into ``HFModelWrapper`` options.
+
+    Expert parallelism operates on the grouped model structure created by the wrapper, so every FSDP role
+    must derive these options from the same role-specific config that its ``FSDPStrategy`` consumes.
+    """
+    return {
+        "moe_router_replay": bool(fsdp_config.get("moe_router_replay", False)),
+        "moe_grouped_gemm": bool(fsdp_config.get("moe_grouped_gemm", False)),
+        "use_grouped_mm": bool(fsdp_config.get("use_grouped_mm", False)),
+    }
+
+
 class FSDPWeightExtractor(WeightExtractor):
     """Extracts weights from FSDP-sharded models.
 
@@ -653,9 +666,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 use_torch_compile=self.cfg.trainer.policy.use_torch_compile,
                 rope_scaling=get_rope_scaling_config(self.cfg.trainer),
                 rope_theta=get_rope_theta_config(self.cfg.trainer),
-                moe_router_replay=bool(self.cfg.trainer.policy.fsdp_config.get("moe_router_replay", False)),
-                moe_grouped_gemm=bool(self.cfg.trainer.policy.fsdp_config.get("moe_grouped_gemm", False)),
-                use_grouped_mm=bool(self.cfg.trainer.policy.fsdp_config.get("use_grouped_mm", False)),
+                **_fsdp_moe_model_kwargs(self.cfg.trainer.policy.fsdp_config),
                 attn_backend=self.cfg.trainer.get("attn_backend", "auto"),
                 context_parallel_size=int(self.cfg.trainer.policy.fsdp_config.get("context_parallel_size", 1)),
                 # Stage 4: surface the CP submesh + rotate method so the forward
@@ -1144,8 +1155,7 @@ class FSDPRefWorkerBase(RefWorkerBase):
                 # EP on the ref requires the same grouped-experts swap as the
                 # policy — _fsdp_init_model asserts num_sharded > 0 when
                 # expert_model_parallel_size > 1 and finds nothing without it.
-                moe_grouped_gemm=bool(self.cfg.trainer.ref.fsdp_config.get("moe_grouped_gemm", False)),
-                use_grouped_mm=bool(self.cfg.trainer.ref.fsdp_config.get("use_grouped_mm", False)),
+                **_fsdp_moe_model_kwargs(self.cfg.trainer.ref.fsdp_config),
                 attn_backend=self.cfg.trainer.get("attn_backend", "auto"),
                 context_parallel_size=int(self.cfg.trainer.ref.fsdp_config.get("context_parallel_size", 1)),
                 # Stage 4: ref-logprob forward must CP-shard identically to the
