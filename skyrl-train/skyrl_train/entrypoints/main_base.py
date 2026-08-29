@@ -204,15 +204,15 @@ class BasePPOExp:
         """Create the configured local or remote inference-engine client."""
         from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient  # noqa: PLC0415
 
+        engine_mode = "local" if self.cfg.generator.run_engines_locally else "remote"
+        logger.info("Starting inference engines: mode={}", engine_mode)
         if self.cfg.generator.run_engines_locally:
-            logger.info("Creating local inference engines")
             inference_engines = create_ray_wrapped_inference_engines_from_config(
                 self.cfg, self.colocate_pg, self.tokenizer
             )
         else:
-            logger.info("Connecting to remote inference engines")
             inference_engines = create_remote_inference_engines_from_config(self.cfg, self.tokenizer)
-        logger.info("Inference engines ready")
+        logger.info("Inference engines ready: mode={} count={}", engine_mode, len(inference_engines))
         return InferenceEngineClient(inference_engines, self.tokenizer, self.cfg)
 
     def _configure_log_level(self):
@@ -480,9 +480,13 @@ class BasePPOExp:
         # Build the models. Pass the pre-reserved dedicated policy placement
         # group (None unless `policy_strict_spread_pg` is enabled for an
         # eligible disaggregated no-ref run).
-        logger.info("Creating policy workers")
+        logger.info("Starting policy workers: strategy={}", self.cfg.trainer.strategy)
         trainer.build_models(PolicyWorker, CriticWorker, RefWorker, policy_pg=self.policy_pg)
-        logger.info("Policy workers ready")
+        logger.info(
+            "Policy workers ready: strategy={} count={}",
+            self.cfg.trainer.strategy,
+            len(trainer.policy_model.actor_infos),
+        )
         return trainer
 
     def run(self):

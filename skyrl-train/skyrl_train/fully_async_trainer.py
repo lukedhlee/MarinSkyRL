@@ -608,12 +608,16 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             self.init_weight_sync_state()
 
         # sync weights to inference engines
-        with Timer("sync_weights_to_inference_engines"):
+        with Timer("sync_weights_to_inference_engines") as weight_update_timer:
             await self.async_sync_policy_weights_to_inference_engines()
             # Drain the policy workers' event loops to a hard sync point so every FSDP
             # shard rank is free before the step-1 forward is dispatched (the MoE-RL
             # async-dispatch wedge fix). See _drain_policy_event_loops.
             await self._drain_policy_event_loops()
+        self._log_weight_update_completed(
+            reason="initial",
+            duration_seconds=weight_update_timer.duration,
+        )
 
         # Create initial trainer state for on_train_begin callback
         start_epoch = self.global_step // self.num_steps_per_epoch
@@ -674,10 +678,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             trajectory_tasks = self._active_trajectory_tasks
 
             for _ in range(self.global_step, (1 + epoch) * self.num_steps_per_epoch + 1):
-                with Timer("step", self.all_timings):
+                with Timer("step", self.all_timings) as step_timer:
                     # 1. Discard every completed stale attempt and wait for a full fresh batch.
+                    logger.info(
+                        "Rollout batch started: step={} mode=fully_async required_groups={}",
+                        self.global_step,
+                        self.mini_batch_size,
+                    )
                     with (
-                        Timer("wait_for_generation_buffer", self.all_timings),
+                        Timer("wait_for_generation_buffer", self.all_timings) as rollout_wait_timer,
                         critical_phase("rollout_or_inference_wait"),
                     ):
                         cur_generation_group_mini_batch = await self._get_admitted_generation_group_mini_batch(
@@ -690,6 +699,22 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             self.convert_generation_group_mini_batch_to_training_input,
                             cur_generation_group_mini_batch,
                         )
+                    response_ids = [
+                        response_ids
+                        for group in cur_generation_group_mini_batch
+                        for response_ids in group.trajectory_batch["response_ids"]
+                    ]
+                    logger.info(
+                        "Rollout batch completed: step={} mode=fully_async groups={} trajectories={} "
+                        "response_tokens={} staleness_mean={:.3f} staleness_max={} duration_seconds={:.3f}",
+                        self.global_step,
+                        len(cur_generation_group_mini_batch),
+                        len(response_ids),
+                        sum(len(response) for response in response_ids),
+                        self.all_metrics["async/staleness_mean"],
+                        self.all_metrics["async/staleness_max"],
+                        rollout_wait_timer.duration,
+                    )
 
                     # TIS graceful-degrade observability (Fix A): record whether THIS
                     # training batch was missing all rollout logprobs (-> TIS skipped,
@@ -712,7 +737,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     # 3. Run training and record consumed UIDs in the tracker.
                     with Timer("run_training", self.all_timings):
                         status = await self._run_training(training_input)
-                        await self.data_tracker.mark_consumed([g.uid for g in cur_generation_group_mini_batch])
+                    train_duration = self.all_timings["train_critic_and_policy"]
+                    self._log_optimizer_step_completed(
+                        epoch=epoch,
+                        training_input=training_input,
+                        duration_seconds=train_duration,
+                    )
+                    await self.data_tracker.mark_consumed([g.uid for g in cur_generation_group_mini_batch])
 
                     # 4. After training: sync weights to the inference engines.
                     #    The inference engines are a SHARED HTTP backend that every
@@ -729,7 +760,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     #    max_staleness_steps accounting — exactly like stock
                     #    fully_async, which never drains trial orchestration. This
                     #    block is now byte-identical for fan-out ON and OFF.
-                    with Timer("sync_weights", self.all_timings):
+                    with Timer("sync_weights", self.all_timings) as weight_update_timer:
                         await self.inference_engine_client.pause_generation()
                         await self.async_sync_policy_weights_to_inference_engines()
                         # Drain the policy workers' event loops to a hard sync point so
@@ -738,6 +769,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         # _drain_policy_event_loops.
                         await self._drain_policy_event_loops()
                         await self.inference_engine_client.resume_generation()
+                    self._log_weight_update_completed(
+                        reason="training_step",
+                        duration_seconds=weight_update_timer.duration,
+                    )
 
                 # 5. Log status and update metrics
                 logger.info(status)
@@ -798,6 +833,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     await self.callback_handler.call_event_async(
                         "on_log", step_state, self._control, logs=log_payload, trainer=self
                     )
+
+                self._log_training_step_completed(
+                    epoch=epoch,
+                    duration_seconds=step_timer.duration,
+                )
 
                 self.all_metrics = {}
                 step_duration = self.all_timings.get("step")
