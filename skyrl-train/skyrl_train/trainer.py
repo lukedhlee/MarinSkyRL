@@ -401,9 +401,6 @@ class RayPPOTrainer:
             f"({self.total_training_steps}); run is already COMPLETE. Skipping further "
             f"training and finalizing (export/upload if missing)."
         )
-        if self.colocate_all:
-            self.policy_model.backload_to_gpu()
-
         await self._finalize_training(
             completed_step=self.global_step,
             epoch=max(self.cfg.trainer.epochs - 1, 0),
@@ -411,7 +408,7 @@ class RayPPOTrainer:
         logger.info("Training already complete on resume — exiting cleanly.")
 
     async def _finalize_training(self, *, completed_step: int, epoch: int) -> None:
-        """Run train-end callbacks and saves at the last completed optimizer step."""
+        """Run train-end callbacks, evaluation, and saves at the last completed optimizer step."""
         self.global_step = completed_step
         final_state = self._create_trainer_state(epoch=epoch)
         self._control.reset()
@@ -419,13 +416,28 @@ class RayPPOTrainer:
             "on_train_end", final_state, self._control, trainer=self
         )
 
-        if self._control.should_save:
-            with Timer("save_checkpoints", self.all_timings):
-                await asyncio.to_thread(self.save_checkpoints)
-                logger.info("Saved final checkpoint.")
-            await self.callback_handler.call_event_async("on_save", final_state, self._control, trainer=self)
-        if self._control.should_save_hf_model:
-            await asyncio.to_thread(self.handle_hf_export)
+        try:
+            if self._control.should_evaluate and self.eval_dataset is not None:
+                with Timer("eval", self.all_timings):
+                    eval_metrics = await self.eval()
+                    self._log_metrics_stdout(eval_metrics, step=self.global_step, kind="eval")
+                    self.tracker.log(eval_metrics, step=self.global_step, commit=True)
+                await self.callback_handler.call_event_async(
+                    "on_evaluate", final_state, self._control, metrics=eval_metrics, trainer=self
+                )
+                self._control.should_evaluate = False
+        finally:
+            if self.colocate_all:
+                await self.inference_engine_client.sleep()
+                self.policy_model.backload_to_gpu()
+
+            if self._control.should_save:
+                with Timer("save_checkpoints", self.all_timings):
+                    await asyncio.to_thread(self.save_checkpoints)
+                    logger.info("Saved final checkpoint.")
+                await self.callback_handler.call_event_async("on_save", final_state, self._control, trainer=self)
+            if self._control.should_save_hf_model:
+                await asyncio.to_thread(self.handle_hf_export)
 
     async def _save_checkpoints_with_residency(self) -> None:
         """Save a checkpoint, swapping colocated training and inference residency when needed."""
@@ -536,19 +548,14 @@ class RayPPOTrainer:
             with Timer("load_checkpoints"):
                 self.global_step, _ = self.load_checkpoints()
 
-            # Resume-overshoot guard: if we resumed AT or PAST max_steps the run is
-            # already complete. The loaded `global_step` is the *completed* step count
-            # (save_checkpoints writes it after a step finishes), so the unconditional
-            # `self.global_step += 1` below would push us to gs N+1 and run one spurious
-            # ("overshoot") step before the post-increment max_steps check fires. Recognize
-            # completion here and exit 0 cleanly (firing on_train_end so a missing final
-            # export/upload still runs). `>=` treats "resumed exactly at max_steps" as done;
-            # a mid-training resume (global_step < total_training_steps) falls through.
-            if self.global_step >= self.total_training_steps:
-                await self._handle_resume_at_max_steps()
-                return
-
         await self._sync_policy_for_rollouts(reason="initial")
+
+        # Synchronize before checking completion so a requested final evaluation uses
+        # the checkpoint weights. The loaded global_step is the completed step count;
+        # >= treats a resume exactly at max_steps as complete without running gs N+1.
+        if self.resume_mode != ResumeMode.NONE and self.global_step >= self.total_training_steps:
+            await self._handle_resume_at_max_steps()
+            return
 
         # initialize kl controller
         if self.cfg.trainer.algorithm.use_kl_in_reward:
@@ -793,10 +800,6 @@ class RayPPOTrainer:
 
         # End of training
         pbar.close()
-        if self.colocate_all:
-            await self.inference_engine_client.sleep()
-            self.policy_model.backload_to_gpu()
-
         await self._finalize_training(
             completed_step=last_completed_step,
             epoch=self.cfg.trainer.epochs - 1,
