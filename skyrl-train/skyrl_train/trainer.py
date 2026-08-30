@@ -88,6 +88,7 @@ from skyrl_train.callbacks import (
     RefModelUpdateCallback,
 )
 from skyrl_train.telemetry import critical_phase, record_generated_work, record_policy_step
+from skyrl_train.timing_observability import publish_startup_timings, publish_step_timings
 from skyrl_train.hf_export import (
     protected_hf_export_steps,
     read_hf_export_request,
@@ -145,6 +146,7 @@ class RayPPOTrainer:
 
         self.all_metrics = {}
         self.all_timings = {}
+        self.all_startup_timings = {}
         self._checkpoint_save_failures = 0.0
         self._shutdown_complete = False
         self.global_step = 0
@@ -479,7 +481,7 @@ class RayPPOTrainer:
         await self.inference_engine_client.wake_up(tags=["weights"])
         with Timer("sync_weights", self.all_timings):
             ray.get(self.sync_policy_weights_to_inference_engines())
-        with Timer("offload_policy_model_to_cpu"):
+        with Timer("offload_policy_model_to_cpu", self.all_timings):
             self.policy_model.offload_to_cpu(offload_optimizer=False, offload_model=True)
         await self.inference_engine_client.wake_up(tags=["kv_cache"])
 
@@ -536,7 +538,7 @@ class RayPPOTrainer:
         points in the training loop to allow extensibility.
         """
         # Initialize weight sync state between policy model and inference engines.
-        with Timer("init_weight_sync_state"):
+        with Timer("init_weight_sync_state", self.all_startup_timings):
             self.init_weight_sync_state()
 
         # Load policy model to GPU before loading checkpoint.
@@ -545,7 +547,7 @@ class RayPPOTrainer:
 
         # Load checkpoint state if resumption is enabled.
         if self.resume_mode != ResumeMode.NONE:
-            with Timer("load_checkpoints"):
+            with Timer("load_checkpoints", self.all_startup_timings):
                 self.global_step, _ = self.load_checkpoints()
 
         await self._sync_policy_for_rollouts(reason="initial")
@@ -556,6 +558,8 @@ class RayPPOTrainer:
         if self.resume_mode != ResumeMode.NONE and self.global_step >= self.total_training_steps:
             await self._handle_resume_at_max_steps()
             return
+
+        self._log_startup_timings()
 
         # initialize kl controller
         if self.cfg.trainer.algorithm.use_kl_in_reward:
@@ -601,7 +605,10 @@ class RayPPOTrainer:
                     )
 
                     # 1.1 generation phase
-                    with Timer("generate", self.all_timings), critical_phase("rollout_or_inference_wait"):
+                    with (
+                        Timer("generate", self.all_timings),
+                        critical_phase("rollout_or_inference_wait", self.global_step),
+                    ):
                         trajectory_batch: TrajectoryBatch = await self.generate(trajectory_request)
 
                     if self.cfg.trainer.step_wise_training:
@@ -669,12 +676,15 @@ class RayPPOTrainer:
 
                     if self.cfg.trainer.dump_data_batch:
                         # dump data to file
-                        with Timer("dump_data_batch"):
+                        with Timer("dump_data_batch", self.all_timings):
                             self.dump_data(training_input, file_name=f"global_step_{self.global_step}_training_input")
 
                     # 4. train policy/critic model
                     # Policy model is backloaded to GPU during training
-                    with Timer("train_critic_and_policy", self.all_timings), critical_phase("train_step"):
+                    with (
+                        Timer("train_critic_and_policy", self.all_timings),
+                        critical_phase("train_step", self.global_step),
+                    ):
                         status = self.train_critic_and_policy(training_input)
                     train_duration = self.all_timings["train_critic_and_policy"]
                     self._log_optimizer_step_completed(
@@ -764,6 +774,7 @@ class RayPPOTrainer:
                 )
 
                 self.all_metrics = {}
+                publish_step_timings(self.all_timings, self.global_step)
                 self.all_timings = {}
 
                 # 10. Update progress bar and global step
@@ -1334,7 +1345,7 @@ class RayPPOTrainer:
 
         if not self.cfg.trainer.step_wise_training:
             validate_trajectory_batch(len(input_batch["prompts"]), trajectory_batch)
-        record_generated_work(trajectory_batch["response_ids"], trajectory_batch.get("is_last_step"))
+        record_generated_work(trajectory_batch["response_ids"], trajectory_batch.get("is_last_step"), self.global_step)
         response_tokens = sum(len(response_ids) for response_ids in trajectory_batch["response_ids"])
         logger.info(
             "Rollout batch completed: step={} mode=synchronous prompts={} trajectories={} "
@@ -2265,6 +2276,15 @@ class RayPPOTrainer:
         )
         request_path = write_hf_export_request(request)
         logger.info(f"Queued out-of-band HF export for global_step_{self.global_step}: {request_path}")
+
+    def _log_startup_timings(self) -> None:
+        publish_startup_timings(
+            self.all_startup_timings,
+            self.all_timings,
+            step=self.global_step,
+            tracker=self.tracker,
+            console=self._log_metrics_stdout,
+        )
 
     def _log_metrics_stdout(self, payload: Dict[str, Any], step: int, kind: str = "train") -> None:
         """Mirror the wandb/tracker payload to stdout so metrics are recoverable without wandb access."""

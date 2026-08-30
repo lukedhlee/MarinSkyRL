@@ -19,6 +19,7 @@ Supports two configuration styles:
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import os
 from typing import Any, Dict, List, Optional, Type
@@ -33,6 +34,13 @@ from skyrl_train.trajectory_runners.base import TrajectoryBatch
 from skyrl_train.json_serialization import to_jsonable
 from skyrl_train.utils.data_tracker import DataConsumptionState, DataConsumptionTracker
 from skyrl_train.io import io
+from skyrl_train.inference_engines.vllm.stats import IntervalReadMode
+from skyrl_train.vllm_observability import (
+    VLLMMetricsSink,
+    configured_vllm_sinks,
+    format_console_summary,
+    trainer_metrics,
+)
 
 from .base import TrainerCallback, TrainerState, TrainerControl, CallbackHandler
 from .types import (
@@ -563,35 +571,27 @@ class PreflightGateCallback(TrainerCallback):
 
 @register_callback("vllm_stats")
 class VLLMStatsCallback(TrainerCallback):
-    """
-    Callback for collecting and logging vLLM inference engine statistics.
-
-    This callback queries vLLM engines directly for their stats (prompt/generation
-    throughput, KV cache usage, request counts) bypassing Ray's log-to-driver
-    functionality which can be unreliable.
-
-    Stats are logged to both console (loguru) and wandb (if available).
-
-    Args:
-        log_every_steps: Log stats every N steps. Default 1 (every step).
-        log_to_console: Whether to log stats to console via loguru. Default True.
-        log_to_wandb: Whether to log stats to wandb. Default True.
-        console_log_level: Log level for console output ("info", "debug"). Default "info".
-    """
+    """Collect one canonical vLLM snapshot and fan it out to independent sinks."""
 
     def __init__(
         self,
         log_every_steps: int = 1,
         log_to_console: bool = True,
-        log_to_wandb: bool = True,
+        log_to_tracker: bool = True,
         console_log_level: str = "info",
+        poll_interval_seconds: float = 5.0,
+        sinks: tuple[VLLMMetricsSink, ...] | None = None,
     ):
         self.log_every_steps = log_every_steps
         self.log_to_console = log_to_console
-        self.log_to_wandb = log_to_wandb
+        self.log_to_tracker = log_to_tracker
         self.console_log_level = console_log_level.lower()
-        self._wandb_available: Optional[bool] = None
+        self.poll_interval_seconds = poll_interval_seconds
+        self._sinks = sinks
         self._inference_engine_client = None
+        self._poll_task: asyncio.Task | None = None
+        self._read_lock = asyncio.Lock()
+        self._step = 0
 
     def on_train_begin(
         self,
@@ -599,7 +599,6 @@ class VLLMStatsCallback(TrainerCallback):
         control: TrainerControl,
         **kwargs,
     ) -> Optional[TrainerControl]:
-        """Cache reference to inference engine client at training start."""
         trainer = kwargs.get("trainer")
         if trainer is not None:
             self._inference_engine_client = getattr(trainer, "inference_engine_client", None)
@@ -607,7 +606,36 @@ class VLLMStatsCallback(TrainerCallback):
                 logger.warning(
                     "VLLMStatsCallback: No inference_engine_client found on trainer. Stats collection will be disabled."
                 )
+        if self._sinks is None:
+            self._sinks = configured_vllm_sinks()
         return control
+
+    async def on_train_begin_async(self, state: TrainerState, control: TrainerControl, **kwargs):
+        self.on_train_begin(state, control, **kwargs)
+        self._step = state.global_step
+        if self._inference_engine_client is not None and self._sinks and self.poll_interval_seconds > 0:
+            self._poll_task = asyncio.create_task(self._poll(), name="vllm-stats-poll")
+        return control
+
+    async def on_train_end_async(self, state: TrainerState, control: TrainerControl, **kwargs):
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._poll_task
+            self._poll_task = None
+        return control
+
+    async def _poll(self) -> None:
+        while True:
+            await asyncio.sleep(self.poll_interval_seconds)
+            try:
+                async with self._read_lock:
+                    snapshot = await self._inference_engine_client.get_stats(read_mode=IntervalReadMode.PEEK)
+                self._publish_sinks(snapshot, self._step)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("VLLMStatsCallback: periodic collection failed", exc_info=True)
 
     async def on_step_end_async(
         self,
@@ -615,199 +643,36 @@ class VLLMStatsCallback(TrainerCallback):
         control: TrainerControl,
         **kwargs,
     ) -> Optional[TrainerControl]:
-        """Query engines for stats and log them."""
-        if self.log_every_steps <= 0:
+        if self.log_every_steps <= 0 or state.global_step % self.log_every_steps != 0:
             return control
-
-        if state.global_step % self.log_every_steps != 0:
-            return control
-
         if self._inference_engine_client is None:
             return control
 
+        self._step = state.global_step
         try:
-            stats = await self._inference_engine_client.get_stats()
-            self._log_stats(stats, state.global_step)
-        except Exception as e:
-            logger.warning(f"VLLMStatsCallback: Failed to collect stats: {e}")
+            async with self._read_lock:
+                snapshot = await self._inference_engine_client.get_stats(read_mode=IntervalReadMode.RESET)
+        except Exception:
+            logger.warning("VLLMStatsCallback: Failed to collect stats", exc_info=True)
+            return control
 
+        metrics = trainer_metrics(snapshot)
+        if not metrics:
+            return control
+        if self.log_to_tracker:
+            kwargs["trainer"].all_metrics.update(metrics)
+        if self.log_to_console:
+            log = logger.debug if self.console_log_level == "debug" else logger.info
+            log(format_console_summary(metrics, state.global_step))
+        self._publish_sinks(snapshot, state.global_step)
         return control
 
-    def _log_stats(self, stats: Dict[str, Any], global_step: int) -> None:
-        """Log stats to console and wandb."""
-        num_engines = stats.get("num_engines", 0)
-        if num_engines == 0:
-            return
-
-        # Build log message with both peak and median stats
-        total_samples = stats.get("total_samples", 0)
-        total_active = stats.get("total_active_samples", 0)
-
-        # Use new field names if available, fall back to legacy
-        peak_running = stats.get("total_peak_running_reqs", stats.get("total_running_reqs", 0))
-        peak_waiting = stats.get("total_peak_waiting_reqs", stats.get("total_waiting_reqs", 0))
-        peak_prompt_tp = stats.get("avg_peak_prompt_throughput", stats.get("avg_prompt_throughput", 0.0))
-        peak_gen_tp = stats.get("avg_peak_generation_throughput", stats.get("avg_generation_throughput", 0.0))
-        peak_kv_cache = stats.get("avg_peak_gpu_cache_usage_perc", stats.get("avg_gpu_cache_usage_perc", 0.0))
-
-        median_running = stats.get("avg_median_running_reqs", 0.0)
-        median_waiting = stats.get("avg_median_waiting_reqs", 0.0)
-        median_prompt_tp = stats.get("avg_median_prompt_throughput", 0.0)
-        median_gen_tp = stats.get("avg_median_generation_throughput", 0.0)
-        median_kv_cache = stats.get("avg_median_gpu_cache_usage_perc", 0.0)
-
-        # Latency stats
-        prefill_mean = stats.get("avg_latency_prefill_mean", 0.0)
-        prefill_p90 = stats.get("max_latency_prefill_p90", 0.0)
-        decode_mean = stats.get("avg_latency_decode_mean", 0.0)
-        decode_p90 = stats.get("max_latency_decode_p90", 0.0)
-        e2e_mean = stats.get("avg_latency_e2e_mean", 0.0)
-        e2e_p90 = stats.get("max_latency_e2e_p90", 0.0)
-        queued_mean = stats.get("avg_latency_queued_mean", 0.0)
-        ttft_mean = stats.get("avg_latency_ttft_mean", 0.0)
-        total_finished = stats.get("total_finished_requests", 0)
-        total_preempted = stats.get("total_preempted_reqs", 0)
-
-        msg = (
-            f"vLLM Stats (step {global_step}): "
-            f"engines={num_engines}, "
-            f"running(peak/med)={peak_running}/{median_running:.0f}, "
-            f"waiting(peak/med)={peak_waiting}/{median_waiting:.0f}, "
-            f"prompt_tp(peak/med)={peak_prompt_tp:.1f}/{median_prompt_tp:.1f} tok/s, "
-            f"gen_tp(peak/med)={peak_gen_tp:.1f}/{median_gen_tp:.1f} tok/s, "
-            f"kv_cache(peak/med)={peak_kv_cache:.1f}/{median_kv_cache:.1f}%"
-        )
-        if total_finished > 0:
-            msg += (
-                f", prefill(mean/p90)={prefill_mean:.2f}/{prefill_p90:.2f}s"
-                f", decode(mean/p90)={decode_mean:.2f}/{decode_p90:.2f}s"
-                f", e2e(mean/p90)={e2e_mean:.2f}/{e2e_p90:.2f}s"
-                f", queued={queued_mean:.2f}s, ttft={ttft_mean:.2f}s"
-                f", finished={total_finished}, preempted={total_preempted}"
-            )
-        if total_samples > 0:
-            msg += f", samples={total_active}/{total_samples}"
-
-        # Log to console
-        if self.log_to_console:
-            if self.console_log_level == "debug":
-                logger.debug(msg)
-            else:
-                logger.info(msg)
-
-        # Log to wandb
-        if self.log_to_wandb:
-            self._log_to_wandb(stats, global_step)
-
-    def _log_to_wandb(self, stats: Dict[str, Any], global_step: int) -> None:
-        """Log stats to wandb if available."""
-        # Lazy check for wandb availability
-        if self._wandb_available is None:
+    def _publish_sinks(self, snapshot, step: int) -> None:
+        for sink in self._sinks or ():
             try:
-                import wandb
-
-                self._wandb_available = wandb.run is not None
-            except ImportError:
-                self._wandb_available = False
-
-        if not self._wandb_available:
-            return
-
-        try:
-            import wandb
-
-            # Log aggregated metrics (peak and median values accumulated throughout the step)
-            wandb.log(
-                {
-                    "vllm/num_engines": stats["num_engines"],
-                    # Peak metrics
-                    "vllm/peak_running_reqs": stats.get("total_peak_running_reqs", stats.get("total_running_reqs", 0)),
-                    "vllm/peak_waiting_reqs": stats.get("total_peak_waiting_reqs", stats.get("total_waiting_reqs", 0)),
-                    "vllm/peak_prompt_throughput": stats.get(
-                        "avg_peak_prompt_throughput", stats.get("avg_prompt_throughput", 0.0)
-                    ),
-                    "vllm/peak_generation_throughput": stats.get(
-                        "avg_peak_generation_throughput", stats.get("avg_generation_throughput", 0.0)
-                    ),
-                    "vllm/peak_gpu_cache_usage_perc": stats.get(
-                        "avg_peak_gpu_cache_usage_perc", stats.get("avg_gpu_cache_usage_perc", 0.0)
-                    ),
-                    "vllm/peak_prefix_cache_hit_rate": stats.get(
-                        "avg_peak_prefix_cache_hit_rate", stats.get("avg_prefix_cache_hit_rate", 0.0)
-                    ),
-                    # Median metrics
-                    "vllm/median_running_reqs": stats.get("avg_median_running_reqs", 0.0),
-                    "vllm/median_waiting_reqs": stats.get("avg_median_waiting_reqs", 0.0),
-                    "vllm/median_prompt_throughput": stats.get("avg_median_prompt_throughput", 0.0),
-                    "vllm/median_generation_throughput": stats.get("avg_median_generation_throughput", 0.0),
-                    "vllm/median_gpu_cache_usage_perc": stats.get("avg_median_gpu_cache_usage_perc", 0.0),
-                    "vllm/median_prefix_cache_hit_rate": stats.get("avg_median_prefix_cache_hit_rate", 0.0),
-                    # Per-request latency (seconds)
-                    "vllm/latency_prefill_mean": stats.get("avg_latency_prefill_mean", 0.0),
-                    "vllm/latency_prefill_p90": stats.get("max_latency_prefill_p90", 0.0),
-                    "vllm/latency_decode_mean": stats.get("avg_latency_decode_mean", 0.0),
-                    "vllm/latency_decode_p90": stats.get("max_latency_decode_p90", 0.0),
-                    "vllm/latency_e2e_mean": stats.get("avg_latency_e2e_mean", 0.0),
-                    "vllm/latency_e2e_p90": stats.get("max_latency_e2e_p90", 0.0),
-                    "vllm/latency_queued_mean": stats.get("avg_latency_queued_mean", 0.0),
-                    "vllm/latency_queued_p90": stats.get("max_latency_queued_p90", 0.0),
-                    "vllm/latency_ttft_mean": stats.get("avg_latency_ttft_mean", 0.0),
-                    "vllm/latency_ttft_p90": stats.get("max_latency_ttft_p90", 0.0),
-                    "vllm/total_finished_requests": stats.get("total_finished_requests", 0),
-                    "vllm/total_preempted_reqs": stats.get("total_preempted_reqs", 0),
-                    # Metadata
-                    "vllm/total_samples": stats.get("total_samples", 0),
-                    "vllm/total_active_samples": stats.get("total_active_samples", 0),
-                },
-                step=global_step,
-            )
-
-            # Also log per-engine metrics if there are multiple engines
-            if stats["num_engines"] > 1:
-                for i, engine_stats in enumerate(stats.get("engines", [])):
-                    wandb.log(
-                        {
-                            # Peak metrics per engine
-                            f"vllm/engine_{i}/peak_prompt_throughput": engine_stats.get(
-                                "peak_prompt_throughput", engine_stats.get("avg_prompt_throughput", 0.0)
-                            ),
-                            f"vllm/engine_{i}/peak_generation_throughput": engine_stats.get(
-                                "peak_generation_throughput", engine_stats.get("avg_generation_throughput", 0.0)
-                            ),
-                            f"vllm/engine_{i}/peak_running_reqs": engine_stats.get(
-                                "peak_running_reqs", engine_stats.get("num_running_reqs", 0)
-                            ),
-                            f"vllm/engine_{i}/peak_waiting_reqs": engine_stats.get(
-                                "peak_waiting_reqs", engine_stats.get("num_waiting_reqs", 0)
-                            ),
-                            f"vllm/engine_{i}/peak_gpu_cache_usage": engine_stats.get(
-                                "peak_gpu_cache_usage_perc", engine_stats.get("gpu_cache_usage_perc", 0.0)
-                            ),
-                            # Median metrics per engine
-                            f"vllm/engine_{i}/median_prompt_throughput": engine_stats.get(
-                                "median_prompt_throughput", 0.0
-                            ),
-                            f"vllm/engine_{i}/median_generation_throughput": engine_stats.get(
-                                "median_generation_throughput", 0.0
-                            ),
-                            f"vllm/engine_{i}/median_running_reqs": engine_stats.get("median_running_reqs", 0.0),
-                            f"vllm/engine_{i}/median_waiting_reqs": engine_stats.get("median_waiting_reqs", 0.0),
-                            # Per-engine latency stats
-                            f"vllm/engine_{i}/latency_prefill_mean": engine_stats.get("latency_prefill_mean", 0.0),
-                            f"vllm/engine_{i}/latency_prefill_p90": engine_stats.get("latency_prefill_p90", 0.0),
-                            f"vllm/engine_{i}/latency_decode_mean": engine_stats.get("latency_decode_mean", 0.0),
-                            f"vllm/engine_{i}/latency_decode_p90": engine_stats.get("latency_decode_p90", 0.0),
-                            f"vllm/engine_{i}/latency_e2e_mean": engine_stats.get("latency_e2e_mean", 0.0),
-                            f"vllm/engine_{i}/latency_e2e_p90": engine_stats.get("latency_e2e_p90", 0.0),
-                            f"vllm/engine_{i}/latency_queued_mean": engine_stats.get("latency_queued_mean", 0.0),
-                            f"vllm/engine_{i}/latency_ttft_mean": engine_stats.get("latency_ttft_mean", 0.0),
-                            f"vllm/engine_{i}/finished_requests": engine_stats.get("latency_num_finished_requests", 0),
-                            f"vllm/engine_{i}/preempted_reqs": engine_stats.get("total_preempted_reqs", 0),
-                        },
-                        step=global_step,
-                    )
-        except Exception as e:
-            logger.warning(f"VLLMStatsCallback: Failed to log to wandb: {e}")
+                sink.publish(snapshot, step)
+            except Exception:
+                logger.warning(f"VLLMStatsCallback: {type(sink).__name__} failed", exc_info=True)
 
 
 def create_default_callbacks(cfg: DictConfig) -> List[TrainerCallback]:
@@ -916,7 +781,7 @@ def create_default_callbacks(cfg: DictConfig) -> List[TrainerCallback]:
             VLLMStatsCallback(
                 log_every_steps=vllm_stats_interval,
                 log_to_console=True,
-                log_to_wandb=True,
+                log_to_tracker=True,
             )
         )
 

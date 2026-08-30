@@ -1,0 +1,205 @@
+"""Sink adapters for the canonical vLLM engine-stat snapshot."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Protocol
+
+from loguru import logger
+
+from skyrl_train.inference_engines.vllm.stats import VLLMHistogramSnapshot, VLLMStatsSnapshot
+from skyrl_train.telemetry import TelemetryConfig
+
+if TYPE_CHECKING:
+    from rigging.telemetry.metrics import MetricSnapshot
+
+
+class VLLMMetricsSink(Protocol):
+    """An interchangeable destination for one callback-owned snapshot."""
+
+    def publish(self, snapshot: VLLMStatsSnapshot, step: int) -> None: ...
+
+
+def configured_vllm_sinks() -> tuple[VLLMMetricsSink, ...]:
+    """Return the Finelog sink when telemetry is configured and Rigging is installed."""
+    if not TelemetryConfig.from_environment().endpoint:
+        return ()
+    try:
+        return (FinelogVLLMMetricsSink(),)
+    except ImportError as error:
+        if error.name != "rigging":
+            raise
+        logger.info("Rigging is unavailable; vLLM Finelog metrics are disabled")
+        return ()
+
+
+def trainer_metrics(snapshot: VLLMStatsSnapshot) -> dict[str, float]:
+    """Project lossless engine observations into the tracker's flat scalar contract."""
+    engines = snapshot.engines
+    if not engines:
+        return {}
+    intervals = [engine.interval for engine in engines]
+    count = len(intervals)
+    finished = sum(item.finished_requests for item in intervals)
+
+    def average(name: str) -> float:
+        return sum(float(getattr(item, name)) for item in intervals) / count
+
+    def weighted(name: str) -> float:
+        if not finished:
+            return 0.0
+        return sum(float(getattr(item, name)) * item.finished_requests for item in intervals) / finished
+
+    return {
+        "vllm/num_engines": float(count),
+        "vllm/peak_running_reqs": float(sum(item.peak_running_reqs for item in intervals)),
+        "vllm/peak_waiting_reqs": float(sum(item.peak_waiting_reqs for item in intervals)),
+        "vllm/peak_prompt_throughput": average("peak_prompt_throughput"),
+        "vllm/peak_generation_throughput": average("peak_generation_throughput"),
+        "vllm/peak_gpu_cache_usage_perc": average("peak_gpu_cache_usage_perc"),
+        "vllm/peak_prefix_cache_hit_rate": average("peak_prefix_cache_hit_rate"),
+        "vllm/median_running_reqs": average("median_running_reqs"),
+        "vllm/median_waiting_reqs": average("median_waiting_reqs"),
+        "vllm/median_prompt_throughput": average("median_prompt_throughput"),
+        "vllm/median_generation_throughput": average("median_generation_throughput"),
+        "vllm/median_gpu_cache_usage_perc": average("median_gpu_cache_usage_perc"),
+        "vllm/median_prefix_cache_hit_rate": average("median_prefix_cache_hit_rate"),
+        "vllm/latency_prefill_mean": weighted("latency_prefill_mean"),
+        "vllm/latency_prefill_p90": max(item.latency_prefill_p90 for item in intervals),
+        "vllm/latency_decode_mean": weighted("latency_decode_mean"),
+        "vllm/latency_decode_p90": max(item.latency_decode_p90 for item in intervals),
+        "vllm/latency_e2e_mean": weighted("latency_e2e_mean"),
+        "vllm/latency_e2e_p90": max(item.latency_e2e_p90 for item in intervals),
+        "vllm/latency_queued_mean": weighted("latency_queued_mean"),
+        "vllm/latency_queued_p90": max(item.latency_queued_p90 for item in intervals),
+        "vllm/latency_ttft_mean": weighted("latency_ttft_mean"),
+        "vllm/latency_ttft_p90": max(item.latency_ttft_p90 for item in intervals),
+        "vllm/total_finished_requests": float(finished),
+        "vllm/total_preempted_reqs": float(sum(item.preempted_reqs for item in intervals)),
+        "vllm/total_samples": float(sum(item.samples for item in intervals)),
+        "vllm/total_active_samples": float(sum(item.active_samples for item in intervals)),
+    }
+
+
+def format_console_summary(metrics: Mapping[str, float], step: int) -> str:
+    """Format the compact console view without coupling collection to a logger."""
+    return (
+        f"vLLM Stats (step {step}): engines={metrics['vllm/num_engines']:.0f}, "
+        f"running={metrics['vllm/median_running_reqs']:.1f}/{metrics['vllm/peak_running_reqs']:.0f}, "
+        f"waiting={metrics['vllm/median_waiting_reqs']:.1f}/{metrics['vllm/peak_waiting_reqs']:.0f}, "
+        f"generation={metrics['vllm/median_generation_throughput']:.1f}/"
+        f"{metrics['vllm/peak_generation_throughput']:.1f} tok/s, "
+        f"kv_cache={metrics['vllm/median_gpu_cache_usage_perc']:.1f}/"
+        f"{metrics['vllm/peak_gpu_cache_usage_perc']:.1f}%, "
+        f"e2e={metrics['vllm/latency_e2e_mean']:.3f}s"
+    )
+
+
+class FinelogVLLMMetricsSink:
+    """Convert the neutral snapshot to Rigging records at the publishing edge."""
+
+    def __init__(self) -> None:
+        from rigging.telemetry.metrics import MetricSnapshotPublisher  # noqa: PLC0415
+
+        self._publisher = MetricSnapshotPublisher(max_records=512, attributes={"metric_source": "vllm"})
+
+    def publish(self, snapshot: VLLMStatsSnapshot, step: int) -> None:
+        from rigging import telemetry  # noqa: PLC0415
+        from rigging.telemetry.metrics import MetricSnapshot  # noqa: PLC0415
+
+        for engine in snapshot.engines:
+            records = []
+            base = {**engine.attributes, "engine": engine.engine_id, "step": str(step)}
+            current = engine.current
+            for name, value, unit, attributes in (
+                ("num_requests_running", current.running_requests, "{request}", {}),
+                (
+                    "num_requests_waiting",
+                    current.waiting_capacity + current.waiting_deferred,
+                    "{request}",
+                    {},
+                ),
+                (
+                    "num_requests_waiting_by_reason",
+                    current.waiting_capacity,
+                    "{request}",
+                    {"reason": "capacity"},
+                ),
+                (
+                    "num_requests_waiting_by_reason",
+                    current.waiting_deferred,
+                    "{request}",
+                    {"reason": "deferred"},
+                ),
+                ("kv_cache_usage_perc", current.kv_cache_usage, "1", {}),
+            ):
+                records.append(
+                    MetricSnapshot(
+                        name=name,
+                        value=value,
+                        unit=unit,
+                        attributes={**base, **attributes},
+                        source_kind="gauge",
+                        source_temporality=telemetry.CURRENT_SNAPSHOT,
+                    )
+                )
+            cumulative = engine.cumulative
+            counters = (
+                ("num_preemptions_total", cumulative.preemptions, "{request}", {}),
+                ("prefix_cache_hits_total", cumulative.prefix_cache_hits, "{token}", {}),
+                ("prefix_cache_queries_total", cumulative.prefix_cache_queries, "{token}", {}),
+                ("generation_tokens_total", cumulative.generation_tokens, "{token}", {}),
+                ("prompt_tokens_total", cumulative.prompt_tokens, "{token}", {}),
+                *(
+                    ("request_success_total", value, "{request}", {"finished_reason": reason})
+                    for reason, value in cumulative.finished_by_reason.items()
+                ),
+            )
+            for name, value, unit, attributes in counters:
+                records.append(
+                    MetricSnapshot(
+                        name=name,
+                        value=value,
+                        unit=unit,
+                        attributes={**base, **attributes},
+                        source_kind="counter",
+                        source_temporality=telemetry.CUMULATIVE_SNAPSHOT,
+                    )
+                )
+            for histogram in engine.histograms:
+                records.extend(_histogram_records(histogram, base, MetricSnapshot, telemetry.CUMULATIVE_SNAPSHOT))
+            if records:
+                self._publisher.publish(records)
+
+
+def _histogram_records(
+    histogram: VLLMHistogramSnapshot,
+    base: Mapping[str, str],
+    metric_snapshot_type: type[MetricSnapshot],
+    cumulative: str,
+) -> list[MetricSnapshot]:
+    attributes = {**base, **histogram.attributes}
+    records = [
+        metric_snapshot_type(
+            name=f"{histogram.name}_bucket",
+            value=value,
+            unit=histogram.unit,
+            attributes={**attributes, "le": "+Inf" if math.isinf(bound) else str(bound)},
+            source_kind="histogram",
+            source_temporality=cumulative,
+        )
+        for bound, value in histogram.buckets
+    ]
+    for suffix, value in (("count", histogram.count), ("sum", histogram.total)):
+        records.append(
+            metric_snapshot_type(
+                name=f"{histogram.name}_{suffix}",
+                value=value,
+                unit=histogram.unit,
+                attributes=attributes,
+                source_kind="histogram",
+                source_temporality=cumulative,
+            )
+        )
+    return records

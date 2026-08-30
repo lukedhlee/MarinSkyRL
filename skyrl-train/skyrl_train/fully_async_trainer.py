@@ -37,7 +37,14 @@ from typing import List, Tuple, TypeVar
 from enum import Enum, auto
 from omegaconf import OmegaConf
 from skyrl_train.callbacks import TrainerState
-from skyrl_train.telemetry import critical_phase, record_generated_work, record_policy_step, record_rollout_buffer
+from skyrl_train.telemetry import (
+    critical_phase,
+    record_generated_work,
+    record_policy_step,
+    record_rollout_buffer,
+    record_rollout_staleness,
+)
+from skyrl_train.timing_observability import publish_step_timings
 from skyrl_train.async_rollout_state import GeneratedOutputGroup, GenerationBufferState
 from skyrl_train.io import io
 from skyrl_train.dynamic_sampling import (
@@ -607,9 +614,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         """
         self.global_step = 0
 
-        # `rollout.fanout.enabled` defaults to TRUE, so the flag does not gate this -- reaching this
-        # trainer does, via `entrypoint: fully_async`, or `terminal_bench` with `colocate_all: false`.
-        # Absent `terminal_bench_config` it raises rather than falling back.
+        # Fan-out is opt-in. When enabled, a missing terminal_bench_config raises instead of falling back.
         self._maybe_enable_rollout_fanout()
 
         try:
@@ -633,7 +638,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # Data consumption state is loaded via DataTrackingCallback.load_from_checkpoint()
         # into self.data_tracker, which the async dataloader reads for skip-on-resume.
         if self.resume_mode != ResumeMode.NONE:
-            with Timer("load_checkpoints"):
+            with Timer("load_checkpoints", self.all_startup_timings):
                 self.global_step, checkpoint_path = self.load_checkpoints()
                 logger.info(f"Resumed training from global_step {self.global_step}")
 
@@ -668,11 +673,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             )
 
         # Initialize weight sync state
-        with Timer("init_weight_sync_state"):
+        with Timer("init_weight_sync_state", self.all_startup_timings):
             self.init_weight_sync_state()
 
         # sync weights to inference engines
-        with Timer("sync_weights_to_inference_engines") as weight_update_timer:
+        with Timer("sync_weights_to_inference_engines", self.all_startup_timings) as weight_update_timer:
             await self.async_sync_policy_weights_to_inference_engines()
             # Drain the policy workers' event loops to a hard sync point so every FSDP
             # shard rank is free before the step-1 forward is dispatched (the MoE-RL
@@ -689,6 +694,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         if self.resume_mode != ResumeMode.NONE and self.global_step >= self.total_training_steps:
             await self._handle_resume_at_max_steps()
             return
+
+        self._log_startup_timings()
 
         # Create initial trainer state for on_train_begin callback
         start_epoch = self.global_step // self.num_steps_per_epoch
@@ -758,7 +765,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     )
                     with (
                         Timer("wait_for_generation_buffer", self.all_timings) as rollout_wait_timer,
-                        critical_phase("rollout_or_inference_wait"),
+                        critical_phase("rollout_or_inference_wait", self.global_step),
                     ):
                         cur_generation_group_mini_batch = await self._get_admitted_generation_group_mini_batch(
                             generation_queues,
@@ -915,6 +922,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 step_duration = self.all_timings.get("step")
                 if step_duration is not None:
                     self._step_time_history.append(step_duration)
+                publish_step_timings(self.all_timings, self.global_step)
                 self.all_timings = {}
                 pbar.update(1)
 
@@ -1047,11 +1055,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         if self.cfg.trainer.dump_data_batch:
             # dump data to file
-            with Timer("dump_data_batch"):
+            with Timer("dump_data_batch", self.all_timings):
                 self.dump_data(training_input, file_name=f"global_step_{self.global_step}_training_input")
 
         # train policy/critic model
-        with Timer("train_critic_and_policy", self.all_timings), critical_phase("train_step"):
+        with Timer("train_critic_and_policy", self.all_timings), critical_phase("train_step", self.global_step):
             status = await asyncio.to_thread(self.train_critic_and_policy, training_input)
 
         return status
@@ -1083,14 +1091,14 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 cur_trajectory_batch: TrajectoryBatch = await self.trajectory_runner.run(
                     trajectory_request, disable_tqdm=True
                 )
+                actual_step = cur_trajectory_batch.get("actual_global_step")
+                staleness_step = actual_step if actual_step is not None else global_step_at_start
+
                 record_generated_work(
                     cur_trajectory_batch["response_ids"],
                     cur_trajectory_batch.get("is_last_step"),
+                    staleness_step,
                 )
-
-                # Prefer the earliest global step captured during inference over the fallback.
-                actual_step = cur_trajectory_batch.get("actual_global_step")
-                staleness_step = actual_step if actual_step is not None else global_step_at_start
                 completed_group = GeneratedOutputGroup(
                     trajectory_batch=cur_trajectory_batch,
                     uid=uids[0],
@@ -1487,6 +1495,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             trajectory_batches.append(cur_generated_output_group.trajectory_batch)
             group_size = len(cur_generated_output_group.trajectory_batch["response_ids"])
             uids.extend([cur_generated_output_group.uid] * group_size)
+
+        record_rollout_staleness(stalenesses, self.global_step)
 
         assert max(stalenesses) <= self.max_staleness_steps, (
             f"Fresh batch assembly returned staleness {max(stalenesses)} above max {self.max_staleness_steps}"

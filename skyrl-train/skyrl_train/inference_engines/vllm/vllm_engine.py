@@ -54,6 +54,8 @@ from torch.distributed import destroy_process_group
 from skyrl_train.distributed.utils import init_custom_process_group
 from uuid import uuid4
 import warnings
+
+
 from skyrl_train.inference_engines.base import (
     InferenceEngineInterface,
     InferenceEngineInput,
@@ -66,6 +68,15 @@ from skyrl_train.inference_engines.vllm.utils import (
     pop_openai_kwargs,
     ensure_token_ids_in_sse_chunk,
     PrefixCacheHitRateAccumulator,
+)
+from skyrl_train.inference_engines.vllm.stats import (
+    IntervalReadMode,
+    VLLMCumulativeStats,
+    VLLMCurrentStats,
+    VLLMEngineStatsSnapshot,
+    VLLMIntervalStats,
+    VLLMNativeStatsAccumulator,
+    build_1_2_5_buckets,
 )
 from skyrl_train.utils import get_tcp_url, str_to_torch_dtype, torch_dtype_to_str
 import time
@@ -1077,13 +1088,6 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
         # not pass them through to EngineArgs and raise TypeError.
         openai_kwargs = pop_openai_kwargs(kwargs)
         self._openai_sampling_params = openai_kwargs.pop("openai_sampling_params", {})
-        # Pop enable_ray_prometheus_stats - only supported for async engine
-        enable_ray_prometheus_stats = kwargs.pop("enable_ray_prometheus_stats", False)
-        if enable_ray_prometheus_stats:
-            logger.warning(
-                "enable_ray_prometheus_stats is only supported with AsyncVLLMInferenceEngine. "
-                "Set `generator.async_engine=true` to enable Ray Prometheus stats logging."
-            )
         return vllm.LLM(*args, **kwargs)
 
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
@@ -1201,6 +1205,13 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
         super().__init__(*args, **kwargs)
         self.log_interval = 5
         self._engine_id: Optional[int] = None
+        config = args[0] if args else kwargs["vllm_config"]
+        engine_index = args[1] if len(args) > 1 else kwargs.get("engine_index", 0)
+        self._native_attributes = {
+            "model_name": str(config.model_config.served_model_name),
+            "engine": str(engine_index),
+        }
+        self._token_histogram_bounds = build_1_2_5_buckets(config.model_config.max_model_len)
 
     def set_engine_id(self, engine_id: int) -> None:
         """Set the engine ID for this stat logger instance."""
@@ -1228,7 +1239,9 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
 
             if scheduler_stats is not None:
                 current_running = getattr(scheduler_stats, "num_running_reqs", 0)
-                current_waiting = getattr(scheduler_stats, "num_waiting_reqs", 0)
+                current_waiting = getattr(scheduler_stats, "num_waiting_reqs", 0) + getattr(
+                    scheduler_stats, "num_skipped_waiting_reqs", 0
+                )
                 current_cache_usage = getattr(scheduler_stats, "kv_cache_usage", 0.0) * 100.0  # Convert to percentage
                 prefix_cache_stats = scheduler_stats.prefix_cache_stats
 
@@ -1295,6 +1308,10 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
                         "_samples_queued_time": list(finished_queued_times),
                         "_samples_ttft": list(finished_ttfts),
                         "_total_preempted": finished_num_preempted,
+                        "_native": VLLMNativeStatsAccumulator(
+                            self._token_histogram_bounds,
+                            self._native_attributes,
+                        ),
                         # Peak values
                         "_peak_prompt_tp": current_prompt_tp,
                         "_peak_gen_tp": current_gen_tp,
@@ -1336,6 +1353,7 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
                     existing["timestamp"] = time.time()
 
                 existing["_prefix_hit"].observe(prefix_cache_stats, is_active=is_active)
+                existing["_native"].observe(scheduler_stats, iteration_stats)
 
         now = time.monotonic()
         if now - self.last_log_time > self.log_interval:
@@ -1355,18 +1373,8 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
         return sorted_samples[mid]
 
     @classmethod
-    def get_stats_by_engine_id(cls, engine_id: int, reset: bool = True) -> Optional[Dict[str, Any]]:
-        """Get the accumulated stats for a given engine ID.
-
-        Args:
-            engine_id: The engine ID to get stats for.
-            reset: If True, reset the accumulated stats after reading (default True).
-                   This ensures each training step gets fresh stats.
-
-        Returns:
-            Dict with accumulated stats, or None if no stats recorded yet.
-            Includes peak values, median values, and computed averages.
-        """
+    def get_stats_by_engine_id(cls, engine_id: int, reset: bool = True) -> Optional[VLLMEngineStatsSnapshot]:
+        """Return the engine's typed metric snapshot, optionally resetting interval fields."""
         with cls._registry_lock:
             stats = cls._stats_registry.get(engine_id)
             if stats is None:
@@ -1406,58 +1414,71 @@ class V1LoggingStatLoggerFixed(LoggingStatLogger):
                 idx = int(len(sorted_s) * 0.9)
                 return sorted_s[min(idx, len(sorted_s) - 1)]
 
-            result = {
-                # Peak values
-                "peak_prompt_throughput": stats["_peak_prompt_tp"],
-                "peak_generation_throughput": stats["_peak_gen_tp"],
-                "peak_running_reqs": stats["_peak_running"],
-                "peak_waiting_reqs": stats["_peak_waiting"],
-                "peak_gpu_cache_usage_perc": stats["_peak_cache"],
-                "peak_prefix_cache_hit_rate": stats["_prefix_hit"].peak,
-                # Median values
-                "median_prompt_throughput": median_prompt_tp,
-                "median_generation_throughput": median_gen_tp,
-                "median_running_reqs": median_running,
-                "median_waiting_reqs": median_waiting,
-                "median_gpu_cache_usage_perc": median_cache,
-                "median_prefix_cache_hit_rate": median_prefix_hit,
-                # Mean values
-                "mean_prompt_throughput": mean_prompt_tp,
-                "mean_generation_throughput": mean_gen_tp,
-                # Per-request latency stats (seconds)
-                "latency_prefill_mean": _mean(prefill_samples),
-                "latency_prefill_median": cls._compute_median(prefill_samples),
-                "latency_prefill_p90": _p90(prefill_samples),
-                "latency_decode_mean": _mean(decode_samples),
-                "latency_decode_median": cls._compute_median(decode_samples),
-                "latency_decode_p90": _p90(decode_samples),
-                "latency_e2e_mean": _mean(e2e_samples),
-                "latency_e2e_median": cls._compute_median(e2e_samples),
-                "latency_e2e_p90": _p90(e2e_samples),
-                "latency_queued_mean": _mean(queued_samples),
-                "latency_queued_median": cls._compute_median(queued_samples),
-                "latency_queued_p90": _p90(queued_samples),
-                "latency_ttft_mean": _mean(ttft_samples),
-                "latency_ttft_median": cls._compute_median(ttft_samples),
-                "latency_ttft_p90": _p90(ttft_samples),
-                "latency_num_finished_requests": len(e2e_samples),
-                "total_preempted_reqs": stats["_total_preempted"],
-                # Legacy field names for backwards compatibility (use peak values)
-                "avg_prompt_throughput": stats["_peak_prompt_tp"],
-                "avg_generation_throughput": stats["_peak_gen_tp"],
-                "num_running_reqs": stats["_peak_running"],
-                "num_waiting_reqs": stats["_peak_waiting"],
-                "gpu_cache_usage_perc": stats["_peak_cache"],
-                "prefix_cache_hit_rate": stats["_prefix_hit"].peak,
-                # Metadata
-                "timestamp": stats["timestamp"],
-                "num_samples": stats["_num_samples"],
-                "num_active_samples": stats["_num_active_samples"],
-            }
+            native = stats["_native"].snapshot()
+            result = VLLMEngineStatsSnapshot(
+                engine_id=str(engine_id),
+                timestamp=float(stats["timestamp"]),
+                current=native.current,
+                cumulative=native.cumulative,
+                interval=VLLMIntervalStats(
+                    peak_prompt_throughput=stats["_peak_prompt_tp"],
+                    peak_generation_throughput=stats["_peak_gen_tp"],
+                    peak_running_reqs=stats["_peak_running"],
+                    peak_waiting_reqs=stats["_peak_waiting"],
+                    peak_gpu_cache_usage_perc=stats["_peak_cache"],
+                    peak_prefix_cache_hit_rate=stats["_prefix_hit"].peak,
+                    median_prompt_throughput=median_prompt_tp,
+                    median_generation_throughput=median_gen_tp,
+                    median_running_reqs=median_running,
+                    median_waiting_reqs=median_waiting,
+                    median_gpu_cache_usage_perc=median_cache,
+                    median_prefix_cache_hit_rate=median_prefix_hit,
+                    mean_prompt_throughput=mean_prompt_tp,
+                    mean_generation_throughput=mean_gen_tp,
+                    latency_prefill_mean=_mean(prefill_samples),
+                    latency_prefill_median=cls._compute_median(prefill_samples),
+                    latency_prefill_p90=_p90(prefill_samples),
+                    latency_decode_mean=_mean(decode_samples),
+                    latency_decode_median=cls._compute_median(decode_samples),
+                    latency_decode_p90=_p90(decode_samples),
+                    latency_e2e_mean=_mean(e2e_samples),
+                    latency_e2e_median=cls._compute_median(e2e_samples),
+                    latency_e2e_p90=_p90(e2e_samples),
+                    latency_queued_mean=_mean(queued_samples),
+                    latency_queued_median=cls._compute_median(queued_samples),
+                    latency_queued_p90=_p90(queued_samples),
+                    latency_ttft_mean=_mean(ttft_samples),
+                    latency_ttft_median=cls._compute_median(ttft_samples),
+                    latency_ttft_p90=_p90(ttft_samples),
+                    finished_requests=len(e2e_samples),
+                    preempted_reqs=stats["_total_preempted"],
+                    samples=stats["_num_samples"],
+                    active_samples=stats["_num_active_samples"],
+                ),
+                attributes=stats["_native"].attributes,
+                histograms=native.histograms,
+            )
 
             if reset:
-                # Reset for next step
-                del cls._stats_registry[engine_id]
+                for key in (
+                    "_samples_prompt_tp",
+                    "_samples_gen_tp",
+                    "_samples_running",
+                    "_samples_waiting",
+                    "_samples_cache",
+                    "_samples_prefill_time",
+                    "_samples_decode_time",
+                    "_samples_e2e_latency",
+                    "_samples_queued_time",
+                    "_samples_ttft",
+                ):
+                    stats[key].clear()
+                stats["_prefix_hit"] = PrefixCacheHitRateAccumulator()
+                for key in ("_peak_prompt_tp", "_peak_gen_tp", "_peak_running", "_peak_waiting", "_peak_cache"):
+                    stats[key] = 0
+                stats["_total_preempted"] = 0
+                stats["_num_samples"] = 0
+                stats["_num_active_samples"] = 0
 
             return result
 
@@ -1493,8 +1514,6 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
                 f"top_p={self._openai_sampling_params.get('top_p', 1.0)}, "
                 f"top_k={self._openai_sampling_params.get('top_k', -1)}"
             )
-        enable_ray_prometheus_stats = kwargs.pop("enable_ray_prometheus_stats", False)
-
         # TODO (erictang000): potentially enable log requests for a debugging mode
         custom_chat_template_path = kwargs.pop("custom_chat_template_chat_completion_path", None)
         # Use factory to inject engine ID into stat logger
@@ -1511,18 +1530,14 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             _engine_arg_fields = {f.name for f in _dataclass_fields(vllm.AsyncEngineArgs)}
         except TypeError:
             _engine_arg_fields = set()
+        if "disable_log_stats" in _engine_arg_fields:
+            kwargs["disable_log_stats"] = True
         if "enable_log_requests" in _engine_arg_fields:
             engine_args = vllm.AsyncEngineArgs(enable_log_requests=False, **kwargs)
         elif "disable_log_requests" in _engine_arg_fields:
             engine_args = vllm.AsyncEngineArgs(disable_log_requests=True, **kwargs)
         else:
             engine_args = vllm.AsyncEngineArgs(**kwargs)
-
-        # Add Ray Prometheus stat loggers if enabled
-        if enable_ray_prometheus_stats:
-            ray_loggers = self._create_ray_prometheus_stat_loggers()
-            if ray_loggers:
-                stat_loggers.extend(ray_loggers)
 
         # Stagger engine startup to avoid TOCTOU port collisions (EADDRINUSE).
         # vLLM's get_open_port() queries a free port then releases the socket;
@@ -1747,30 +1762,6 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
                     request_logger=None,
                 )
         return engine
-
-    def _create_ray_prometheus_stat_loggers(self):
-        """Create Ray Prometheus stat loggers for vLLM metrics.
-
-        Returns stat_loggers in the format expected by vLLM's from_engine_args().
-        For vLLM v1 (0.9.0+), this returns a list of StatLoggerFactory callables.
-        For older versions where the v1 API is not available, this returns `None`.
-
-        See: https://docs.vllm.ai/en/latest/api/vllm/v1/metrics/ray_wrappers/
-        """
-        try:
-            # Try vLLM v1 API first (0.9.0+)
-            from vllm.v1.metrics.ray_wrappers import RayPrometheusStatLogger
-
-            logger.info("Enabling RayPrometheusStatLogger for vLLM inference engine metrics")
-            # For v1, stat_loggers is a list of factory callables
-            return [RayPrometheusStatLogger]
-        except ImportError:
-            logger.warning(
-                "RayPrometheusStatLogger not available in this vLLM version. "
-                "For Ray-integrated metrics, upgrade to vLLM >= 0.9.0. "
-                "Stat logging will be disabled."
-            )
-            return None
 
     async def _load_lora_from_disk(self, lora_path: str):
         """Load LoRA adapters from disk using vLLM's native add_lora method."""
@@ -2119,76 +2110,21 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             yield f"data: {json.dumps(err)}\n\n"
             yield "data: [DONE]\n\n"
 
-    async def get_stats(self) -> Dict[str, Any]:
-        """Get accumulated vLLM engine statistics for the current step.
-
-        Returns a dict with the following keys:
-        - peak_*: Peak values observed during the step
-        - median_*: Median values across active samples
-        - mean_*: Mean values across active samples
-        - num_samples: Total number of stat samples collected
-        - num_active_samples: Number of samples with active requests
-        - timestamp: Unix timestamp of last sample
-        - engine_id: Unique identifier for this engine instance
-
-        Note: Stats are reset after reading to provide fresh stats per training step.
-
-        Used by VLLMStatsCallback to collect and aggregate stats across engines.
-        """
-        # Reset=True ensures each training step gets fresh stats
-        stats = V1LoggingStatLoggerFixed.get_stats_by_engine_id(self._stats_engine_id, reset=True)
-        if stats is None:
-            # Return empty stats if no data recorded yet
-            stats = {
-                # Peak values
-                "peak_prompt_throughput": 0.0,
-                "peak_generation_throughput": 0.0,
-                "peak_running_reqs": 0,
-                "peak_waiting_reqs": 0,
-                "peak_gpu_cache_usage_perc": 0.0,
-                "peak_prefix_cache_hit_rate": 0.0,
-                # Median values
-                "median_prompt_throughput": 0.0,
-                "median_generation_throughput": 0.0,
-                "median_running_reqs": 0.0,
-                "median_waiting_reqs": 0.0,
-                "median_gpu_cache_usage_perc": 0.0,
-                "median_prefix_cache_hit_rate": 0.0,
-                # Mean values
-                "mean_prompt_throughput": 0.0,
-                "mean_generation_throughput": 0.0,
-                # Per-request latency stats
-                "latency_prefill_mean": 0.0,
-                "latency_prefill_median": 0.0,
-                "latency_prefill_p90": 0.0,
-                "latency_decode_mean": 0.0,
-                "latency_decode_median": 0.0,
-                "latency_decode_p90": 0.0,
-                "latency_e2e_mean": 0.0,
-                "latency_e2e_median": 0.0,
-                "latency_e2e_p90": 0.0,
-                "latency_queued_mean": 0.0,
-                "latency_queued_median": 0.0,
-                "latency_queued_p90": 0.0,
-                "latency_ttft_mean": 0.0,
-                "latency_ttft_median": 0.0,
-                "latency_ttft_p90": 0.0,
-                "latency_num_finished_requests": 0,
-                "total_preempted_reqs": 0,
-                # Legacy field names
-                "avg_prompt_throughput": 0.0,
-                "avg_generation_throughput": 0.0,
-                "num_running_reqs": 0,
-                "num_waiting_reqs": 0,
-                "gpu_cache_usage_perc": 0.0,
-                "prefix_cache_hit_rate": 0.0,
-                # Metadata
-                "num_samples": 0,
-                "num_active_samples": 0,
-                "timestamp": time.time(),
-            }
-        stats["engine_id"] = self._stats_engine_id
-        return stats
+    async def get_stats(self, read_mode: IntervalReadMode = IntervalReadMode.RESET) -> VLLMEngineStatsSnapshot:
+        """Return the engine's complete typed snapshot without publishing it."""
+        snapshot = V1LoggingStatLoggerFixed.get_stats_by_engine_id(
+            self._stats_engine_id,
+            reset=read_mode is IntervalReadMode.RESET,
+        )
+        if snapshot is not None:
+            return snapshot
+        return VLLMEngineStatsSnapshot(
+            engine_id=str(self._stats_engine_id),
+            timestamp=time.time(),
+            current=VLLMCurrentStats(),
+            cumulative=VLLMCumulativeStats(),
+            interval=VLLMIntervalStats(),
+        )
 
     async def pause_generation(self) -> None:
         """Abort outstanding requests and hold the EngineCore scheduler idle for weight reload."""
