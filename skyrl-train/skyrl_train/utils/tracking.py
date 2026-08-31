@@ -68,6 +68,8 @@ class Tracking:
         self.logger = {}
 
         if "wandb" in backends:
+            import os
+
             import wandb
             from omegaconf import OmegaConf
 
@@ -78,23 +80,34 @@ class Tracking:
                 except Exception as e:
                     logger.warning(f"Failed to get node IP address, defaulting to 'head'. Error: {e}")
 
-            run = wandb.init(
+            init_kwargs = dict(
                 project=project_name,
                 name=experiment_name,
                 config=OmegaConf.to_container(config, resolve=True),
                 group=experiment_name,
                 resume="allow",
-                settings=wandb.Settings(
-                    mode="shared",  # mainly for multi-node training's systems metrics aggregation
-                    x_primary=True,
-                    x_label=f"node-{current_node_ip}",
-                ),
             )
-            run_id = run.id
-            self.logger["wandb"] = run
-            self._prepare_worker_nodes_systems_logging_wandb(
-                project_name, experiment_name, run_id, config, current_node_ip
-            )
+            if os.environ.get("WANDB_MODE", "").lower() == "offline":
+                # Air-gapped compute (e.g. HPC nodes without internet): `Settings(mode="shared")`
+                # below would override WANDB_MODE=offline and block trying to reach api.wandb.ai.
+                # Honor offline mode explicitly and skip the per-node systems loggers, which are
+                # only meaningful when aggregating into a shared online run.
+                logger.info("WANDB_MODE=offline: initializing wandb offline and skipping per-node systems loggers")
+                self.logger["wandb"] = wandb.init(mode="offline", **init_kwargs)
+            else:
+                run = wandb.init(
+                    **init_kwargs,
+                    settings=wandb.Settings(
+                        mode="shared",  # mainly for multi-node training's systems metrics aggregation
+                        x_primary=True,
+                        x_label=f"node-{current_node_ip}",
+                    ),
+                )
+                run_id = run.id
+                self.logger["wandb"] = run
+                self._prepare_worker_nodes_systems_logging_wandb(
+                    project_name, experiment_name, run_id, config, current_node_ip
+                )
 
         if "mlflow" in backends:
             self.logger["mlflow"] = _MlflowLoggingAdapter(project_name, experiment_name, config)
