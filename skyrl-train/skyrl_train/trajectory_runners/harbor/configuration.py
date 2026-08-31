@@ -859,6 +859,7 @@ class HarborConfigBuilder:
         api_base: str,
         session_id: str,
         timeout_override_sec: Optional[int] = None,
+        sampling_params: Optional[dict] = None,
     ) -> TrialConfig:
         """
         Build a complete TrialConfig for a Harbor trial.
@@ -872,6 +873,9 @@ class HarborConfigBuilder:
             timeout_override_sec: Optional timeout override in seconds.
                 If provided, overrides the default override_timeout_sec from config.
                 Useful for eval runs that may need different timeouts.
+            sampling_params: Optional dict with the trainer's sampling settings
+                (temperature/top_p/top_k); threaded into the agent's LLM calls
+                so vLLM does not fall back to the checkpoint's generation_config.
 
         Returns:
             Configured TrialConfig ready for Trial execution.
@@ -891,6 +895,26 @@ class HarborConfigBuilder:
                 "model_info": self._model_info,
             }
         )
+
+        # Thread the trainer's sampling params into the agent's LLM calls.
+        # Without this the request carries no temperature/top_p/top_k and vLLM
+        # falls back to the served checkpoint's generation_config.json, so
+        # rollouts are sampled from a distribution the trainer never sees
+        # (marin-community/MarinSkyRL#438, finding 2). Explicit YAML agent
+        # kwargs win over the trainer values.
+        if sampling_params:
+            if sampling_params.get("temperature") is not None:
+                agent_kwargs.setdefault(
+                    "temperature", float(sampling_params["temperature"])
+                )
+            if sampling_params.get("top_p") is not None:
+                call_kwargs = dict(agent_kwargs.get("llm_call_kwargs") or {})
+                call_kwargs.setdefault("top_p", float(sampling_params["top_p"]))
+                agent_kwargs["llm_call_kwargs"] = call_kwargs
+            if sampling_params.get("top_k") is not None:
+                extra_body = dict(agent_kwargs.get("extra_body") or {})
+                extra_body.setdefault("top_k", int(sampling_params["top_k"]))
+                agent_kwargs["extra_body"] = extra_body
 
         # Inject PRM turn_callback if configured
         if self._turn_callback is not None:

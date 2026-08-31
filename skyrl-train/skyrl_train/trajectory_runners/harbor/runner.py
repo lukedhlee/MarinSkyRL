@@ -919,6 +919,20 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             "exclude_from_baseline": [not disposition.baseline_eligible for _ in range(num_trials)],
         }
 
+    def _trial_sampling_params(self) -> dict:
+        """Trainer sampling settings to thread into each trial's LLM calls.
+
+        Without this the agent's requests carry no temperature/top_p/top_k and
+        vLLM silently falls back to the served checkpoint's
+        generation_config.json (marin-community/MarinSkyRL#438, finding 2).
+        """
+        sp = self.trajectory_runner_cfg.sampling_params
+        return {
+            "temperature": sp.get("temperature"),
+            "top_p": sp.get("top_p"),
+            "top_k": sp.get("top_k"),
+        }
+
     async def _run(self, input_batch: TrajectoryRequestBatch, disable_tqdm: bool = False) -> TrajectoryBatch:
         """
         Generate rollouts for a batch of prompts using the active QueueOrchestrator.
@@ -971,6 +985,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 api_base=self._agent_api_base,
                 session_id=session_id,
                 timeout_override_sec=timeout_override,
+                sampling_params=self._trial_sampling_params(),
             )
             trial_configs.append(trial_config)
             trajectory_ids.append(trajectory_id)
