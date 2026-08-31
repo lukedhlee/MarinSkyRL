@@ -57,6 +57,11 @@ STAGE2_TRAINER_FIELDS = {
 DEBUG_MODE_TRAINER_FIELDS = {
     "debug_mode": "off",
 }
+# Opt-in rollout diagnostics (default off => no-op); additive, unrelated to CP.
+DIAG_TRAINER_FIELDS = {
+    "diag_group_metrics": False,
+    "dump_train_rollouts": False,
+}
 RUNTIME_CONFIG_TRAINER_FIELDS = {
     "collective_phase_diagnostics": False,
     "distributed": {
@@ -158,7 +163,7 @@ def test_all_defaults_is_structurally_identical_to_baseline():
         optimizer = container["trainer"][role]["optimizer_config"]
         for k in ADDITIVE_TRAINING_OPTIMIZER_FIELDS:
             optimizer.pop(k, None)
-    for k in (*STAGE2_TRAINER_FIELDS, *DEBUG_MODE_TRAINER_FIELDS, *RUNTIME_CONFIG_TRAINER_FIELDS):
+    for k in (*STAGE2_TRAINER_FIELDS, *DEBUG_MODE_TRAINER_FIELDS, *DIAG_TRAINER_FIELDS, *RUNTIME_CONFIG_TRAINER_FIELDS):
         container["trainer"].pop(k, None)
     for k in ADDITIVE_ALGORITHM_FIELDS:
         container["trainer"]["algorithm"].pop(k, None)

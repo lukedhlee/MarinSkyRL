@@ -294,6 +294,8 @@ trainer:
   tracker_commit_each_step: false
   dump_data_batch: false
   dump_eval_results: true
+  diag_group_metrics: false  # per-group GRPO learnability diagnostics (diag/* metrics)
+  dump_train_rollouts: false  # decoded train rollouts -> <export_path>/dumped_data/global_step_N_train_rollouts.jsonl
   log_level: "INFO"
 
   rope_scaling: null

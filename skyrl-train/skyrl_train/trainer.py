@@ -29,6 +29,7 @@ from skyrl_train.trajectory_runners.base import (
 )
 import copy
 from skyrl_train.trajectory_runners.trajectory_processing import (
+    _outcome_rewards,
     get_metrics_from_trajectory_batch,
     prepare_trajectory_request,
     validate_trajectory_batch,
@@ -38,7 +39,7 @@ from skyrl_train.dataset.preprocess import (
     collate_response_token_channel,
     convert_prompts_responses_to_batch_tensors,
 )
-from skyrl_train.utils import trainer_utils
+from skyrl_train.utils import diag_utils, trainer_utils
 from skyrl_train.io import io
 from skyrl_train.utils import Timer, get_ray_pg_ready_with_timeout, get_system_memory_metrics
 from skyrl_train.utils.policy_math import compute_approx_kl, masked_mean, normalize_advantages_dict
@@ -1430,9 +1431,52 @@ class RayPPOTrainer:
         self.all_metrics.update(reward_metrics)
         logger.info(f"reward/avg_pass_at_{n_samples_per_prompt}: {pass_at_n}, reward/avg_raw_reward: {mean_reward}")
 
+        # Opt-in diagnostics. Runs before the per-token reward reassignment below so the
+        # dump can record response-level rewards. Never allowed to fail the step.
+        self._log_rollout_diagnostics(
+            trajectory_batch, trajectory_batch_for_metrics, uids, uids_for_metrics, n_samples_per_prompt
+        )
+
         # re-assign reward but now it's per token rewards
         trajectory_batch["rewards"] = per_token_rewards
         return trajectory_batch
+
+    def _log_rollout_diagnostics(
+        self,
+        trajectory_batch: TrajectoryBatch,
+        trajectory_batch_for_metrics: TrajectoryBatch,
+        uids: List[str],
+        uids_for_metrics: List[str],
+        n_samples_per_prompt: int,
+    ) -> None:
+        """Per-group GRPO diagnostics (`diag/*`) and decoded rollout dumps, both opt-in via
+        `trainer.diag_group_metrics` / `trainer.dump_train_rollouts` (default off = no-op)."""
+        diag_group_metrics = self.cfg.trainer.get("diag_group_metrics", False)
+        dump_train_rollouts = self.cfg.trainer.get("dump_train_rollouts", False)
+        if not (diag_group_metrics or dump_train_rollouts):
+            return
+        try:
+            if diag_group_metrics:
+                # Same success predicate as pass@n: unshaped outcome reward > 0, so reward
+                # shaping cannot move the learnability metrics.
+                successes = [r > 0.0 for r in _outcome_rewards(trajectory_batch_for_metrics)]
+                stop_reasons = trajectory_batch_for_metrics.get("stop_reasons")
+                self.all_metrics.update(
+                    diag_utils.compute_group_diagnostics(
+                        rewards=trajectory_batch_for_metrics["rewards"],
+                        successes=successes,
+                        uids=uids_for_metrics,
+                        response_lengths=[len(r) for r in trajectory_batch_for_metrics["response_ids"]],
+                        stop_reasons=stop_reasons,
+                        n_samples_per_prompt=n_samples_per_prompt,
+                    )
+                )
+            if dump_train_rollouts:
+                diag_utils.dump_train_rollouts(
+                    trajectory_batch, uids, self.tokenizer, self.cfg.trainer.export_path, self.global_step
+                )
+        except Exception as e:
+            logger.warning(f"rollout diagnostics failed (non-fatal): {e}")
 
     @torch.no_grad()
     def compute_advantages_and_returns(self, data: TrainingInputBatch) -> TrainingInputBatch:
