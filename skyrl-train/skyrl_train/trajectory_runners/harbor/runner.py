@@ -20,7 +20,11 @@ from uuid import uuid4
 from skyrl_train.trajectory_runners.base import TrajectoryRunner, TrajectoryRequestBatch, TrajectoryBatch, TrajectoryID
 from skyrl_train.trajectory_runners.types import VerifierTestCollection
 from skyrl_train.trajectory_runners.projections import project_loss_mask
-from skyrl_train.metric_names import TIS_LCS_FALLBACK_ALERT_METRIC, TIS_METRIC_PREFIX
+from skyrl_train.metric_names import (
+    IDENTITY_AWARE_REWARD_METRIC_PREFIX,
+    TIS_LCS_FALLBACK_ALERT_METRIC,
+    TIS_METRIC_PREFIX,
+)
 from skyrl_train.trajectory_runners.trajectory_processing import (
     BATCH_ERROR_METRIC_PREFIX,
     get_batch_failure_metrics,
@@ -39,6 +43,7 @@ from skyrl_train.trajectory_runners.trajectory_processing import (
 )
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.utils.reward_shaping import (
+    ParsedTestResult,
     parse_test_output_with_parser,
     shape_reward_from_output,
     shape_reward_with_components,
@@ -71,6 +76,10 @@ from harbor.utils.traces_utils import normalize_message
 # Schema-driven Harbor config mapping
 from skyrl_train.trajectory_runners.harbor.configuration import HarborConfigBuilder
 from skyrl_train.trajectory_runners.harbor.contracts import verification_from_harbor_result
+from skyrl_train.trajectory_runners.harbor.identity_aware_reward import (
+    IDENTITY_AWARE_SHAPER,
+    identity_aware_pass_ratios,
+)
 from skyrl_train.trajectory_runners.harbor.truncation_penalty import apply_truncation_penalty, detect_turn_truncation
 
 # Incremental, trial-indexed reader for the shared opencode literal log.
@@ -481,7 +490,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             f"backoff={self._retry_config.min_wait_sec}-{self._retry_config.max_wait_sec}s. "
             f"Concurrent trials: {self._n_concurrent_trials}. "
             f"Reward shaping: enabled={self._reward_shaping_enabled}, "
-            f"shaper={self._reward_shaping_config.get('reward_shaper', 'pass_ratio')}. "
+            f"shaper={self._reward_shaping_config.get('reward_shaper', IDENTITY_AWARE_SHAPER)}. "
             f"Error classification: enabled={self._error_handling_config.enable_error_classification}"
         )
 
@@ -1149,6 +1158,8 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 else:
                     successful_outputs.append(output)
 
+        identity_aware_metrics = self._apply_identity_aware_reward_shaping(all_outputs)
+
         # Calculate rollout metrics for successful outputs
         if len(successful_outputs) > 0:
             rollout_metrics = get_rollout_metrics(
@@ -1191,6 +1202,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 num_masked_trajectories=num_masked_trajectories,
             )
         )
+        rollout_metrics.update(identity_aware_metrics)
 
         # TIS logprob-alignment metrics (aggregated across all trajectories with
         # logprobs). These make an LCS fallback or alignment failure ALWAYS visible
@@ -1650,6 +1662,28 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         )
         return chat_history
 
+    def _collect_verifier_test_evidence(
+        self,
+        result: TrialResult,
+        trajectory_id: TrajectoryID,
+        *,
+        preserve_timeout: bool,
+    ) -> tuple[Optional[ParsedTestResult], Optional[VerifierTestCollection]]:
+        """Parse and identify verifier tests when shaping can consume them."""
+        if preserve_timeout or not self._reward_shaping_enabled:
+            return None, None
+        verifier_stdout = getattr(result.verifier_result, "stdout", None)
+        parsed_tests, parser_name = parse_test_output_with_parser(
+            verifier_stdout or "",
+            self._reward_shaping_config.get("reward_parser"),
+        )
+        return parsed_tests, verifier_test_collection(
+            parsed_tests,
+            parser_name=parser_name,
+            instance_id=trajectory_id.instance_id,
+            repetition_id=trajectory_id.repetition_id,
+        )
+
     def _shape_harbor_reward(
         self,
         result: TrialResult,
@@ -1658,35 +1692,31 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         trajectory_id: TrajectoryID,
         *,
         preserve_timeout: bool,
-    ) -> tuple[RewardResult, Optional[VerifierTestCollection]]:
-        """Return the shaped reward and any identified verifier tests.
-
-        The test collection is absent when shaping is disabled or the trial timed out.
-        """
+        parsed_tests: Optional[ParsedTestResult],
+    ) -> RewardResult:
+        """Apply the configured per-trial shaper before any group-aware shaping."""
         if preserve_timeout:
-            return RewardResult(unshaped_reward=None, optimization_reward=0.0), None
+            return RewardResult(unshaped_reward=None, optimization_reward=0.0)
 
         if verification.score is None:
             raise ValueError("verified Harbor results require a score")
         original_reward = verification.score
         reward = original_reward
         reward_components: Optional[Dict[str, float]] = None
-        test_collection = None
         if self._reward_shaping_enabled:
             verifier_stdout = getattr(result.verifier_result, "stdout", None)
-            parsed_tests, parser_name = parse_test_output_with_parser(
-                verifier_stdout or "",
-                self._reward_shaping_config.get("reward_parser"),
-            )
-            test_collection = verifier_test_collection(
-                parsed_tests,
-                parser_name=parser_name,
-                instance_id=trajectory_id.instance_id,
-                repetition_id=trajectory_id.repetition_id,
-            )
-            shaper_name = self._reward_shaping_config.get("reward_shaper", "pass_ratio")
+            shaper_name = self._reward_shaping_config.get("reward_shaper", IDENTITY_AWARE_SHAPER)
             shaper_kwargs = self._reward_shaping_config.get("shaper_kwargs", {})
-            if shaper_name in ("composite", "composite_loop"):
+            if shaper_name == IDENTITY_AWARE_SHAPER:
+                if parsed_tests is None:
+                    if not self._reward_shaping_config.get("reward_shaping_fallback", True):
+                        raise ValueError(
+                            f"could not parse verifier output with parser="
+                            f"{self._reward_shaping_config.get('reward_parser') or 'auto'}"
+                        )
+                else:
+                    reward = parsed_tests.pass_ratio
+            elif shaper_name in ("composite", "composite_loop"):
                 trajectory_context = (
                     detect_termination_signals(chat_history, original_reward)
                     if shaper_name == "composite_loop"
@@ -1716,14 +1746,62 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 f"Trajectory {trajectory_id}: reward shaped {original_reward:.3f} -> {reward:.3f}"
                 + (f" (components={reward_components})" if reward_components else "")
             )
-        return (
-            RewardResult(
-                unshaped_reward=original_reward,
-                optimization_reward=reward,
-                components={} if reward_components is None else reward_components,
-            ),
-            test_collection,
+        return RewardResult(
+            unshaped_reward=original_reward,
+            optimization_reward=reward,
+            components={} if reward_components is None else reward_components,
         )
+
+    def _apply_identity_aware_reward_shaping(
+        self,
+        all_outputs: List[TerminalBenchAgentOutput],
+    ) -> Dict[str, float]:
+        """Mutate group rewards in place and return their rollout metrics.
+
+        An empty mapping means the identity-aware shaper is inactive.
+        """
+        if (
+            not self._reward_shaping_enabled
+            or self._reward_shaping_config.get("reward_shaper", IDENTITY_AWARE_SHAPER) != IDENTITY_AWARE_SHAPER
+        ):
+            return {}
+
+        groups: Dict[str, List[TerminalBenchAgentOutput]] = {}
+        for output in all_outputs:
+            groups.setdefault(output.trajectory_id.instance_id, []).append(output)
+
+        shaper_kwargs = self._reward_shaping_config.get("shaper_kwargs", {})
+        exact_weights = shaper_kwargs.get("test_weights") or {}
+        metrics = {
+            f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/groups": float(len(groups)),
+            f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/fallback_groups": 0.0,
+            f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/zero_informative_groups": 0.0,
+            f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/informative_tests": 0.0,
+        }
+        for outputs in groups.values():
+            aggregate_rewards = [
+                output.reward_result.optimization_reward
+                + (self._truncation_penalty if output.truncation_penalized else 0.0)
+                for output in outputs
+            ]
+            result = identity_aware_pass_ratios(
+                [output.verifier_tests for output in outputs],
+                aggregate_rewards,
+                [output.disposition.baseline_eligible for output in outputs],
+                exact_weights=exact_weights,
+            )
+            for output, reward in zip(outputs, result.rewards, strict=True):
+                if output.truncation_penalized:
+                    reward -= self._truncation_penalty
+                output.reward_result = replace(output.reward_result, optimization_reward=reward)
+            metrics[f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/informative_tests"] += result.informative_test_count
+            if result.fallback_reason is not None:
+                metrics[f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/fallback_groups"] += 1
+                reason_metric = f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/fallback/{result.fallback_reason.value}"
+                metrics[reason_metric] = metrics.get(reason_metric, 0.0) + 1
+            elif result.informative_test_count == 0:
+                metrics[f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/zero_informative_groups"] += 1
+        return metrics
 
     def _process_trial_result(
         self,
@@ -1925,12 +2003,18 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 exclude_from_baseline=exclude_from_baseline,
             )
 
-        reward_result, verifier_tests = self._shape_harbor_reward(
+        parsed_tests, verifier_tests = self._collect_verifier_test_evidence(
+            result,
+            trajectory_id,
+            preserve_timeout=preserve_timeout,
+        )
+        reward_result = self._shape_harbor_reward(
             result,
             verification,
             chat_history,
             trajectory_id,
             preserve_timeout=preserve_timeout,
+            parsed_tests=parsed_tests,
         )
         original_reward = reward_result.unshaped_reward or 0.0
         reward = reward_result.optimization_reward
