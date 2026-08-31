@@ -379,9 +379,9 @@ def fsdp2_load_full_state_dict(
             # assert (B1) fires (job 860696: assembled (32,..) != live (8,..), fsdp=4).
             # Match on the placement TYPE so _StridedShard._split_tensor (which honors
             # the strided layout, as the docstring already intends) actually runs.
-            from torch.distributed.tensor.placement_types import Shard
-            from torch.distributed.tensor._dtensor_spec import _StridedShard
-
+            # `Shard` / `_StridedShard` come from the module-level import of
+            # `torch.distributed.tensor.placement_types`; torch>=2.9 no longer exposes
+            # `_StridedShard` on `torch.distributed.tensor._dtensor_spec`.
             mesh = dtensor_meta.device_mesh
             placements = dtensor_meta.placements
             coord = mesh.get_coordinate()  # this rank's coord per mesh dim
