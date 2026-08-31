@@ -1,4 +1,5 @@
 import os
+import gc
 import random
 from datetime import timedelta
 from typing import List, Union, Optional
@@ -133,6 +134,25 @@ class MegatronStrategy(DistributedStrategy):
     ) -> Union[List[ModelOrModelOptimPair], ModelOrModelOptimPair]:
         raise NotImplementedError()
 
+    def _optimizer_checkpoint_metadata(self) -> dict:
+        # Megatron's default `fully_sharded_model_space` optimizer format is
+        # deprecated and creates flattened-range ShardedTensors, which this
+        # MCore checkpointing build rejects. The dp-reshardable format avoids
+        # flattened ranges and the DP gather required by fully-reshardable saves,
+        # so it is the stable format for same-topology Megatron resume.
+        sharding_type = os.environ.get("SKYRL_MEGATRON_OPTIMIZER_SHARDING_TYPE", "dp_reshardable")
+        metadata = {"distrib_optim_sharding_type": sharding_type}
+        mem_efficient = os.environ.get(
+            "SKYRL_MEGATRON_OPTIMIZER_FULLY_RESHARDABLE_MEM_EFFICIENT", "0"
+        ).lower()
+        if sharding_type == "fully_reshardable" and mem_efficient in {
+            "1",
+            "true",
+            "yes",
+        }:
+            metadata["distrib_optim_fully_reshardable_mem_efficient"] = True
+        return metadata
+
     def save_checkpoint(
         self,
         model: MegatronModelWrapper,
@@ -141,6 +161,8 @@ class MegatronStrategy(DistributedStrategy):
         optimizer: Optional[DistributedOptimizer] = None,
         scheduler: Optional[OptimizerParamScheduler] = None,
         tokenizer: Optional[PreTrainedTokenizer] = None,
+        client_state: Optional[dict] = None,
+        tag: Optional[str] = None,
     ):
         # Extract base model.
         model: List[nn.Module] = model.actor_module
@@ -161,12 +183,19 @@ class MegatronStrategy(DistributedStrategy):
         model_sharded_state_dict = model.sharded_state_dict()
         sharded_state_dict["model"] = model_sharded_state_dict
         if optimizer:
-            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(model_sharded_state_dict)
+            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(
+                model_sharded_state_dict,
+                is_loading=False,
+                metadata=self._optimizer_checkpoint_metadata(),
+            )
         if scheduler:
             sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
         # Save RNG state.
         sharded_state_dict["rng"] = self.get_rng_state()
+        sharded_state_dict["client_state"] = client_state or {}
+        if tag is not None:
+            sharded_state_dict["tag"] = tag
 
         # Save the checkpoint across ranks in parallel.
         save_strategy = get_default_save_sharded_strategy("torch_dist")
@@ -174,21 +203,42 @@ class MegatronStrategy(DistributedStrategy):
             save_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
         )
 
-        with io.local_work_dir(ckpt_dir) as work_dir:
-            # TODO(tgriggs): Support configurable async saves.
-            async_save_request = dist_checkpointing.save(
-                sharded_state_dict=sharded_state_dict,
-                checkpoint_dir=work_dir,
-                sharded_strategy=save_strategy,
-                async_sharded_save=False,
-                validate_access_integrity=True,
-            )
-            assert async_save_request is None, "Async save is not yet supported for Megatron"
+        # Megatron's torch_dist save planner hardcodes process_group=None, which
+        # means the default NCCL group. PyTorch object collectives over NCCL can
+        # fail during checkpoint metadata planning on Jupiter, so route only the
+        # planning object collectives through an auxiliary CPU/Gloo group.
+        from megatron.core.dist_checkpointing.strategies import state_dict_saver
 
-            # Only global rank 0 saves the Huggingface config and tokenizer.
-            if self.is_rank_0():
-                hf_dir = os.path.join(work_dir, "huggingface")
-                self.save_hf_configs(self.hf_config, hf_dir, tokenizer)
+        original_save_state_dict_async_plan = state_dict_saver.save_state_dict_async_plan
+        save_planning_group = dist.new_group(backend="gloo", timeout=timedelta(minutes=30))
+
+        def save_state_dict_async_plan_gloo(state_dict, storage_writer, process_group=None, *args, **kwargs):
+            if process_group is None:
+                process_group = save_planning_group
+            return original_save_state_dict_async_plan(
+                state_dict, storage_writer, process_group, *args, **kwargs
+            )
+
+        state_dict_saver.save_state_dict_async_plan = save_state_dict_async_plan_gloo
+        with io.local_work_dir(ckpt_dir) as work_dir:
+            try:
+                # TODO(tgriggs): Support configurable async saves.
+                async_save_request = dist_checkpointing.save(
+                    sharded_state_dict=sharded_state_dict,
+                    checkpoint_dir=work_dir,
+                    sharded_strategy=save_strategy,
+                    async_sharded_save=False,
+                    validate_access_integrity=False,
+                )
+                assert async_save_request is None, "Async save is not yet supported for Megatron"
+
+                # Only global rank 0 saves the Huggingface config and tokenizer.
+                if self.is_rank_0():
+                    hf_dir = os.path.join(work_dir, "huggingface")
+                    self.save_hf_configs(self.hf_config, hf_dir, tokenizer)
+            finally:
+                state_dict_saver.save_state_dict_async_plan = original_save_state_dict_async_plan
+                dist.destroy_process_group(save_planning_group)
 
         dist.barrier()
         ckpt_base.async_calls.close()
@@ -220,16 +270,17 @@ class MegatronStrategy(DistributedStrategy):
         model_sharded_state_dict = unwrapped_model.sharded_state_dict()
         sharded_state_dict["model"] = model_sharded_state_dict
         if optimizer and load_optimizer_states:
-            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(model_sharded_state_dict)
+            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(
+                model_sharded_state_dict,
+                is_loading=True,
+                metadata=self._optimizer_checkpoint_metadata(),
+            )
         if scheduler and load_lr_scheduler_states:
             sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
         with io.local_read_dir(ckpt_dir) as read_dir:
             # Load the checkpoint in parallel.
             load_strategy = get_default_load_sharded_strategy(read_dir)
-            load_strategy = FullyParallelLoadStrategyWrapper(
-                load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
-            )
             state_dict = dist_checkpointing.load(
                 sharded_state_dict=sharded_state_dict, checkpoint_dir=read_dir, sharded_strategy=load_strategy
             )
@@ -238,28 +289,40 @@ class MegatronStrategy(DistributedStrategy):
         assert (
             "model" in state_dict
         ), f"Model state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
-        model[0].load_state_dict(state_dict["model"], strict=load_module_strict)
+        model_state = state_dict.pop("model")
+        model[0].load_state_dict(model_state, strict=load_module_strict)
+        del model_state
+        gc.collect()
+        torch.cuda.empty_cache()
         self.print("Loaded model state dict.")
 
         if optimizer and load_optimizer_states:
             assert (
                 "optimizer" in state_dict
             ), f"Optimizer state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
-            optimizer.load_state_dict(state_dict["optimizer"])
+            optimizer_state = state_dict.pop("optimizer")
+            optimizer.load_state_dict(optimizer_state)
+            del optimizer_state
+            gc.collect()
+            torch.cuda.empty_cache()
             self.print("Loaded optimizer state dict.")
 
         if scheduler and load_lr_scheduler_states:
             assert (
                 "lr_scheduler" in state_dict
             ), f"LR scheduler state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
-            scheduler.load_state_dict(state_dict["lr_scheduler"])
+            scheduler.load_state_dict(state_dict.pop("lr_scheduler"))
             self.print("Loaded LR scheduler state dict.")
 
         # Load RNG state, if present.
         if "rng" in state_dict:
             self.load_rng_state(state_dict["rng"])
 
-        return ckpt_dir, {}
+        states = {
+            "client_state": state_dict.get("client_state", {}),
+            "tag": state_dict.get("tag"),
+        }
+        return ckpt_dir, states
 
     def save_hf_model(self, bridge, model: MegatronModelWrapper, output_dir: str, tokenizer=None, **kwargs) -> None:
         # Create checkpoint directory if it doesn't exist.

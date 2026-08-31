@@ -38,7 +38,16 @@ class DistributedStrategy(ABC):
         pass
 
     @abstractmethod
-    def save_checkpoint(self, model, ckpt_dir, node_local_rank, optimizer, scheduler, tokenizer):
+    def save_checkpoint(
+        self,
+        model,
+        ckpt_dir,
+        node_local_rank,
+        optimizer,
+        scheduler,
+        tokenizer,
+        **kwargs,
+    ):
         """Save checkpoint"""
         pass
 

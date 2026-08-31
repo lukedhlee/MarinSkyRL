@@ -1429,7 +1429,13 @@ class PolicyWorkerBase(Worker):
         status["response_length"] = num_actions
         return status
 
-    def save_checkpoint(self, ckpt_dir: Path, tokenizer=None):
+    def save_checkpoint(
+        self,
+        ckpt_dir: Path,
+        tokenizer=None,
+        save_optimizer_states: bool = True,
+        save_lr_scheduler_states: bool = True,
+    ):
         # Persist ZClip / StaleClip state alongside the model so warmup
         # counters and EMA stats survive chain-restarts. Without this,
         # warmup_buffer resets to [] on every resume and (with default
@@ -1443,8 +1449,8 @@ class PolicyWorkerBase(Worker):
                 client_state["stale_clip_state"] = sc_state
         self.strategy.save_checkpoint(
             model=self.model,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
+            optimizer=self.optimizer if save_optimizer_states else None,
+            scheduler=self.scheduler if save_lr_scheduler_states else None,
             ckpt_dir=ckpt_dir,
             node_local_rank=self.get_node_local_rank(),
             tokenizer=tokenizer,
@@ -1669,11 +1675,17 @@ class CriticWorkerBase(Worker):
             status["raw_grad_norm"] = grad_norm
         return status
 
-    def save_checkpoint(self, ckpt_dir: str, tokenizer=None):
+    def save_checkpoint(
+        self,
+        ckpt_dir: str,
+        tokenizer=None,
+        save_optimizer_states: bool = True,
+        save_lr_scheduler_states: bool = True,
+    ):
         self.strategy.save_checkpoint(
             model=self.model,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
+            optimizer=self.optimizer if save_optimizer_states else None,
+            scheduler=self.scheduler if save_lr_scheduler_states else None,
             ckpt_dir=ckpt_dir,
             node_local_rank=self.get_node_local_rank(),
             tokenizer=tokenizer,

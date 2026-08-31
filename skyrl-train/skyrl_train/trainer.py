@@ -1765,6 +1765,8 @@ class RayPPOTrainer:
         global_step_folder = os.path.join(self.cfg.trainer.ckpt_path, f"global_step_{self.global_step}")
         policy_save_dir = os.path.join(global_step_folder, "policy")
         critic_save_dir = os.path.join(global_step_folder, "critic")
+        save_optimizer_states = bool(getattr(self.cfg.trainer, "save_optimizer_states", True))
+        save_lr_scheduler_states = bool(getattr(self.cfg.trainer, "save_lr_scheduler_states", True))
 
         io.makedirs(global_step_folder, exist_ok=True)
 
@@ -1775,6 +1777,8 @@ class RayPPOTrainer:
                 "save_checkpoint",
                 ckpt_dir=policy_save_dir,
                 tokenizer=self.tokenizer,
+                save_optimizer_states=save_optimizer_states,
+                save_lr_scheduler_states=save_lr_scheduler_states,
             )
         )
 
@@ -1790,6 +1794,8 @@ class RayPPOTrainer:
                     "save_checkpoint",
                     ckpt_dir=critic_save_dir,
                     tokenizer=self.tokenizer,
+                    save_optimizer_states=save_optimizer_states,
+                    save_lr_scheduler_states=save_lr_scheduler_states,
                 )
             )
 
@@ -1932,13 +1938,15 @@ class RayPPOTrainer:
 
         # 3. Load policy checkpoint
         logger.info(f"Loading policy checkpoint from {policy_ckpt_dir}")
+        load_optimizer_states = bool(getattr(self.cfg.trainer, "load_optimizer_states", True))
+        load_lr_scheduler_states = bool(getattr(self.cfg.trainer, "load_lr_scheduler_states", True))
         _ = ray.get(
             self.policy_model.async_run_ray_method(
                 "pass_through",
                 "load_checkpoint",
                 ckpt_dir=policy_ckpt_dir,
-                load_optimizer_states=True,
-                load_lr_scheduler_states=True,
+                load_optimizer_states=load_optimizer_states,
+                load_lr_scheduler_states=load_lr_scheduler_states,
             )
         )
         logger.info("Successfully loaded policy checkpoint")
@@ -1951,8 +1959,8 @@ class RayPPOTrainer:
                     "pass_through",
                     "load_checkpoint",
                     ckpt_dir=critic_ckpt_dir,
-                    load_optimizer_states=True,
-                    load_lr_scheduler_states=True,
+                    load_optimizer_states=load_optimizer_states,
+                    load_lr_scheduler_states=load_lr_scheduler_states,
                 )
             )
             logger.info("Successfully loaded critic checkpoint")
