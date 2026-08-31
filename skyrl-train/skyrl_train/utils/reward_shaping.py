@@ -646,12 +646,13 @@ class GenericOutputParser(OutputParser):
 
 
 class PassRatioSummaryOutputParser(OutputParser):
-    """Parse verifier summaries such as ``Results: 13/20 passed (ratio=0.65)``."""
+    """Parse pass-ratio summaries and explicit no-solution failures."""
 
     SUMMARY_PATTERN = re.compile(
         r"^Results:\s*(\d+)\s*/\s*(\d+)\s+passed(?:\s*\(ratio\s*=\s*[\d.]+\))?\s*$",
         re.IGNORECASE | re.MULTILINE,
     )
+    NO_SOLUTION_PATTERN = re.compile(r"^No solution found at .+$", re.IGNORECASE | re.MULTILINE)
 
     @classmethod
     def name(cls) -> str:
@@ -660,7 +661,14 @@ class PassRatioSummaryOutputParser(OutputParser):
     def parse(self, output: str) -> Optional[ParsedTestResult]:
         match = self.SUMMARY_PATTERN.search(output)
         if match is None:
-            return None
+            if self.NO_SOLUTION_PATTERN.search(output) is None:
+                return None
+            return ParsedTestResult(
+                passed=0,
+                failed=1,
+                raw_output=output,
+                metadata={"parse_method": "no_solution"},
+            )
         passed = int(match.group(1))
         total = int(match.group(2))
         if passed > total:

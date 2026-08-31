@@ -72,6 +72,7 @@ from skyrl_train.trajectory_runners.harbor._harbor_compat import (
 from harbor.models.trial.config import TrialConfig
 from harbor.models.trial.result import TrialResult
 from harbor.utils.traces_utils import normalize_message
+from harbor.verifier.verifier import VerifierOutputParseError
 
 # Schema-driven Harbor config mapping
 from skyrl_train.trajectory_runners.harbor.configuration import HarborConfigBuilder
@@ -2003,19 +2004,22 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 exclude_from_baseline=exclude_from_baseline,
             )
 
-        parsed_tests, verifier_tests = self._collect_verifier_test_evidence(
-            result,
-            trajectory_id,
-            preserve_timeout=preserve_timeout,
-        )
-        reward_result = self._shape_harbor_reward(
-            result,
-            verification,
-            chat_history,
-            trajectory_id,
-            preserve_timeout=preserve_timeout,
-            parsed_tests=parsed_tests,
-        )
+        try:
+            parsed_tests, verifier_tests = self._collect_verifier_test_evidence(
+                result,
+                trajectory_id,
+                preserve_timeout=preserve_timeout,
+            )
+            reward_result = self._shape_harbor_reward(
+                result,
+                verification,
+                chat_history,
+                trajectory_id,
+                preserve_timeout=preserve_timeout,
+                parsed_tests=parsed_tests,
+            )
+        except ValueError as error:
+            raise VerifierOutputParseError("could not interpret verifier output for reward shaping") from error
         original_reward = reward_result.unshaped_reward or 0.0
         reward = reward_result.optimization_reward
 
