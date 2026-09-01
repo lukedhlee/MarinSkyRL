@@ -1,44 +1,58 @@
-"""Sink adapters for the canonical vLLM engine-stat snapshot."""
+"""Sink adapters for the canonical inference-service snapshot."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
 from loguru import logger
 
-from skyrl_train.inference_engines.vllm.stats import VLLMHistogramSnapshot, VLLMStatsSnapshot
+from skyrl_train.inference_engines.vllm.stats import (
+    HTTP_BRIDGE_METRIC_NAMES,
+    VLLM_NUM_ENGINES_METRIC,
+    InferenceStatsSnapshot,
+    VLLMEngineStatsSnapshot,
+    VLLMHistogramSnapshot,
+)
 from skyrl_train.telemetry import TelemetryConfig
 
-if TYPE_CHECKING:
-    from rigging.telemetry.metrics import MetricSnapshot
 
-
-class VLLMMetricsSink(Protocol):
+class InferenceMetricsSink(Protocol):
     """An interchangeable destination for one callback-owned snapshot."""
 
-    def publish(self, snapshot: VLLMStatsSnapshot, step: int) -> None: ...
+    def publish(self, snapshot: InferenceStatsSnapshot, step: int) -> None: ...
 
 
-def configured_vllm_sinks() -> tuple[VLLMMetricsSink, ...]:
+def configured_inference_sinks() -> tuple[InferenceMetricsSink, ...]:
     """Return the Finelog sink when telemetry is configured and Rigging is installed."""
     if not TelemetryConfig.from_environment().endpoint:
         return ()
     try:
-        return (FinelogVLLMMetricsSink(),)
+        return (FinelogInferenceMetricsSink(),)
     except ImportError as error:
         if error.name != "rigging":
             raise
-        logger.info("Rigging is unavailable; vLLM Finelog metrics are disabled")
+        logger.info("Rigging is unavailable; inference Finelog metrics are disabled")
         return ()
 
 
-def trainer_metrics(snapshot: VLLMStatsSnapshot) -> dict[str, float]:
-    """Project lossless engine observations into the tracker's flat scalar contract."""
+def trainer_metrics(snapshot: InferenceStatsSnapshot) -> dict[str, float]:
+    """Project engine and HTTP bridge observations into the tracker's flat scalar contract."""
     engines = snapshot.engines
     if not engines:
-        return {}
+        metrics = {}
+    else:
+        metrics = _engine_trainer_metrics(engines)
+    if snapshot.http_bridge is not None:
+        for name in HTTP_BRIDGE_METRIC_NAMES:
+            summary = getattr(snapshot.http_bridge, name)
+            for statistic in ("count", "mean", "p95", "maximum"):
+                metrics[f"inference_bridge/{name}/{statistic}"] = float(getattr(summary, statistic))
+    return metrics
+
+
+def _engine_trainer_metrics(engines: tuple[VLLMEngineStatsSnapshot, ...]) -> dict[str, float]:
     intervals = [engine.interval for engine in engines]
     count = len(intervals)
     finished = sum(item.finished_requests for item in intervals)
@@ -52,7 +66,7 @@ def trainer_metrics(snapshot: VLLMStatsSnapshot) -> dict[str, float]:
         return sum(float(getattr(item, name)) * item.finished_requests for item in intervals) / finished
 
     return {
-        "vllm/num_engines": float(count),
+        VLLM_NUM_ENGINES_METRIC: float(count),
         "vllm/peak_running_reqs": float(sum(item.peak_running_reqs for item in intervals)),
         "vllm/peak_waiting_reqs": float(sum(item.peak_waiting_reqs for item in intervals)),
         "vllm/peak_prompt_throughput": average("peak_prompt_throughput"),
@@ -85,7 +99,7 @@ def trainer_metrics(snapshot: VLLMStatsSnapshot) -> dict[str, float]:
 def format_console_summary(metrics: Mapping[str, float], step: int) -> str:
     """Format the compact console view without coupling collection to a logger."""
     return (
-        f"vLLM Stats (step {step}): engines={metrics['vllm/num_engines']:.0f}, "
+        f"vLLM Stats (step {step}): engines={metrics[VLLM_NUM_ENGINES_METRIC]:.0f}, "
         f"running={metrics['vllm/median_running_reqs']:.1f}/{metrics['vllm/peak_running_reqs']:.0f}, "
         f"waiting={metrics['vllm/median_waiting_reqs']:.1f}/{metrics['vllm/peak_waiting_reqs']:.0f}, "
         f"generation={metrics['vllm/median_generation_throughput']:.1f}/"
@@ -96,15 +110,18 @@ def format_console_summary(metrics: Mapping[str, float], step: int) -> str:
     )
 
 
-class FinelogVLLMMetricsSink:
+class FinelogInferenceMetricsSink:
     """Convert the neutral snapshot to Rigging records at the publishing edge."""
 
     def __init__(self) -> None:
         from rigging.telemetry.metrics import MetricSnapshotPublisher  # noqa: PLC0415
 
         self._publisher = MetricSnapshotPublisher(max_records=512, attributes={"metric_source": "vllm"})
+        self._bridge_publisher = MetricSnapshotPublisher(
+            max_records=512, attributes={"metric_source": "inference_http_bridge"}
+        )
 
-    def publish(self, snapshot: VLLMStatsSnapshot, step: int) -> None:
+    def publish(self, snapshot: InferenceStatsSnapshot, step: int) -> None:
         from rigging import telemetry  # noqa: PLC0415
         from rigging.telemetry.metrics import MetricSnapshot  # noqa: PLC0415
 
@@ -171,14 +188,45 @@ class FinelogVLLMMetricsSink:
                 records.extend(_histogram_records(histogram, base, MetricSnapshot, telemetry.CUMULATIVE_SNAPSHOT))
             if records:
                 self._publisher.publish(records)
+        if snapshot.http_bridge is not None:
+            records = []
+            for histogram in snapshot.http_bridge.histograms:
+                records.extend(
+                    _histogram_records(
+                        histogram,
+                        {"step": str(step)},
+                        MetricSnapshot,
+                        telemetry.CUMULATIVE_SNAPSHOT,
+                    )
+                )
+            if records:
+                self._bridge_publisher.publish(records)
+
+
+class _MetricRecord(Protocol):
+    name: str
+    attributes: Mapping[str, str]
+
+
+class _MetricRecordFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        name: str,
+        value: float,
+        unit: str,
+        attributes: Mapping[str, str],
+        source_kind: str,
+        source_temporality: str,
+    ) -> _MetricRecord: ...
 
 
 def _histogram_records(
     histogram: VLLMHistogramSnapshot,
     base: Mapping[str, str],
-    metric_snapshot_type: type[MetricSnapshot],
+    metric_snapshot_type: _MetricRecordFactory,
     cumulative: str,
-) -> list[MetricSnapshot]:
+) -> list[_MetricRecord]:
     attributes = {**base, **histogram.attributes}
     records = [
         metric_snapshot_type(

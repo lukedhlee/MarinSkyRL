@@ -6,7 +6,6 @@ import threading
 import zipfile
 
 import pytest
-from omegaconf import OmegaConf
 
 from skyrl_train.trajectory_runners.base import (
     BatchMetadata,
@@ -15,7 +14,7 @@ from skyrl_train.trajectory_runners.base import (
     TrajectoryBatch,
     TrajectoryID,
 )
-from skyrl_train.fully_async_trainer import FullyAsyncRayPPOTrainer
+from skyrl_train.trajectory_runners.harbor.execution import HarborRunnerSpec, ProcessPoolResources
 from skyrl_train.trajectory_runners.harbor.rollout_dispatcher import RolloutDispatcher
 from skyrl_train.trajectory_runners.trajectory_processing import concatenate_trajectory_batches
 from skyrl_train.trajectory_runners.trajectory_retention import (
@@ -624,68 +623,44 @@ def test_initialization_reconciles_archive_written_before_ledger_commit(tmp_path
     assert len(list(tmp_path.rglob("*.zip"))) == 1
 
 
-class _FanoutCoordinator:
+class _ProcessCoordinator:
     """One coordinator actor that returns a finished batch, standing in for the Ray RPC."""
 
     def __init__(self):
-        self.run_shard = _FanoutRemote()
+        self.run_shard = _ProcessRemote()
 
 
-class _FanoutRemote:
-    def remote(self, *_args):
+class _ProcessRemote:
+    def remote(self, input_batch, *_args):
+        positions = {trajectory_id.to_string(): index for index, trajectory_id in enumerate(_input()["trajectory_ids"])}
+        indices = [positions[trajectory_id.to_string()] for trajectory_id in input_batch["trajectory_ids"]]
+        _, output = _select_batch_rows(indices)
         future = asyncio.get_running_loop().create_future()
-        future.set_result(_output())
+        future.set_result(output)
         return future
 
 
-def _fanout_dispatcher() -> RolloutDispatcher:
+def _process_dispatcher(harbor_runner_spec: HarborRunnerSpec) -> RolloutDispatcher:
     dispatcher = RolloutDispatcher(
-        cfg=OmegaConf.create({}),
-        trajectory_runner_cfg=OmegaConf.create({}),
-        terminal_bench_cfg=OmegaConf.create({}),
-        num_coordinators=1,
-        cpus_per_coordinator=1,
-        coordinator_rpc_timeout=30.0,
+        spec=harbor_runner_spec,
+        resources=ProcessPoolResources(1, 1, 1, 30),
     )
-    dispatcher._actors = [_FanoutCoordinator()]
+    dispatcher._actors = [_ProcessCoordinator()]
     return dispatcher
 
 
 @pytest.mark.asyncio
-async def test_fanout_retains_its_coordinators_batch_under_the_harbor_runner(tmp_path):
-    """Retention under fan-out, where the dispatcher replaced the runner the sink was attached to."""
-    dispatcher = _fanout_dispatcher()
+async def test_process_dispatcher_retains_its_coordinators_batch_under_the_harbor_runner(tmp_path, harbor_runner_spec):
+    """Retention when the process dispatcher replaces the runner the sink was attached to."""
+    dispatcher = _process_dispatcher(harbor_runner_spec)
     dispatcher.set_trajectory_sink(TrajectorySink(_config(tmp_path), _Tokenizer()))
 
     output = await dispatcher.run(_input())
 
     assert output["rollout_metrics"]["generate/trajectory_retention/written"] == 3.0
     assert {record["trajectory"]["instance_id"] for record in _records(tmp_path)} == {"a", "b", "c"}
-    # The proxy must not stamp its own name: retained provenance is identical with fan-out on or off.
+    # The proxy must not stamp its own name: retained provenance is independent of process placement.
     assert {record["provenance"]["runner"] for record in _records(tmp_path)} == {"HarborTrajectoryRunner"}
-
-
-@pytest.mark.asyncio
-async def test_enabling_fanout_keeps_the_already_attached_sink_working(tmp_path):
-    """Replacing the trajectory runner reattaches its retention sink."""
-    trainer = FullyAsyncRayPPOTrainer.__new__(FullyAsyncRayPPOTrainer)
-    trainer.cfg = OmegaConf.create(
-        {
-            "rollout": {"fanout": {"enabled": True, "num_coordinators": 1, "coordinator_rpc_timeout": 30.0}},
-            "terminal_bench_config": {},
-            "generator": {},
-        }
-    )
-    # Bound as RayPPOTrainer.__init__ leaves it: rebinding to a different name would raise.
-    trainer.trajectory_sink = TrajectorySink(_config(tmp_path), _Tokenizer())
-    trainer.trajectory_sink.bind_runner("HarborTrajectoryRunner")
-
-    trainer._maybe_enable_rollout_fanout()
-    trainer.trajectory_runner._actors = [_FanoutCoordinator()]
-    output = await trainer.trajectory_runner.run(_input())
-
-    assert output["rollout_metrics"]["generate/trajectory_retention/written"] == 3.0
-    assert len(_records(tmp_path)) == 3
 
 
 def test_retention_takes_the_run_id_the_initiator_set(monkeypatch):
