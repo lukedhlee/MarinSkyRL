@@ -22,7 +22,7 @@ from skyrl_train.trajectory_runners.types import VerifierTestCollection
 from skyrl_train.trajectory_runners.projections import project_loss_mask
 from skyrl_train.metric_names import (
     IDENTITY_AWARE_REWARD_METRIC_PREFIX,
-    TIS_LCS_FALLBACK_ALERT_METRIC,
+    TIS_ALIGNMENT_ALERT_METRIC,
     TIS_METRIC_PREFIX,
 )
 from skyrl_train.trajectory_runners.trajectory_processing import (
@@ -1227,10 +1227,9 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             )
             rollout_metrics.update(align_metrics)
             if batch_align.n_lcs_messages > 0 or batch_align.n_failed_messages > 0:
-                # Metered LCS defensive guard: escalate to ERROR when the alert metric
-                # trips (lcs_fallback_fraction over the configured threshold),
-                # else WARNING. Under full TITO this should never fire.
-                alert = align_metrics.get(TIS_LCS_FALLBACK_ALERT_METRIC, 0.0) >= 1.0
+                # Escalate to ERROR for any unaligned token or when complete LCS
+                # fallback use exceeds the configured threshold.
+                alert = align_metrics.get(TIS_ALIGNMENT_ALERT_METRIC, 0.0) >= 1.0
                 log_fn = logger.error if alert else logger.warning
                 log_fn(
                     f"TIS alignment{' ALERT' if alert else ''}: "
