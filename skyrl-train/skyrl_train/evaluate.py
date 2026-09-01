@@ -1,3 +1,5 @@
+import asyncio
+
 import torch
 from skyrl_train.utils.progress import tqdm
 from typing import Any, Dict, List, Protocol
@@ -115,9 +117,9 @@ async def _collect_evaluation_rollouts(
     last_request = None
     last_batch = None
     try:
-        pbar = tqdm(total=len(eval_dataloader), initial=0, desc="Evaluation Progress")
+        requests = []
+        uids_per_request = []
         for prompts in eval_dataloader:
-            pbar.update(1)
             request, uids = prepare_trajectory_request(
                 prompts,
                 cfg.generator.eval_n_samples_per_prompt,
@@ -126,11 +128,32 @@ async def _collect_evaluation_rollouts(
                 "eval",
                 global_step,
             )
-            batch = await trajectory_runner.run(request)
-            trajectory_batches.append(batch)
-            last_request, last_batch = request, batch
+            requests.append(request)
+            uids_per_request.append(uids)
 
+        pbar = tqdm(total=len(requests), initial=0, desc="Evaluation Progress")
+
+        # Runners that fan trials out across coordinators (harbor fan-out) accept
+        # every chunk up front and bound concurrency internally; issuing the
+        # chunks concurrently keeps all coordinators busy instead of running one
+        # chunk at a time. Other runners keep the sequential contract.
+        if getattr(trajectory_runner, "supports_concurrent_eval", False):
+
+            async def _run_chunk(chunk_request):
+                chunk_batch = await trajectory_runner.run(chunk_request)
+                pbar.update(1)
+                return chunk_batch
+
+            trajectory_batches = list(await asyncio.gather(*[_run_chunk(r) for r in requests]))
+        else:
+            for request in requests:
+                trajectory_batches.append(await trajectory_runner.run(request))
+                pbar.update(1)
+
+        for request, batch, uids in zip(requests, trajectory_batches, uids_per_request):
             accumulator.record(request, batch, uids)
+        if requests:
+            last_request, last_batch = requests[-1], trajectory_batches[-1]
     finally:
         await trajectory_runner.stop_eval_session()
 

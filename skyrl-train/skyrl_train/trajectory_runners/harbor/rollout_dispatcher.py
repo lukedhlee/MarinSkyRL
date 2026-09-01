@@ -358,9 +358,11 @@ class RolloutDispatcher:
         self._actors: List = []
         self._rr = itertools.cycle(range(num_coordinators))
         self._pg = None
-        # When an eval session is active, run() is pinned to shard 0 (the
-        # only coordinator with the eval orchestrator). See start_eval_session.
+        # Eval sessions are broadcast to every coordinator (see
+        # start_eval_session), so eval groups round-robin like training groups.
         self._eval_session_active = False
+        # evaluate() checks this to know it may issue eval chunks concurrently.
+        self.supports_concurrent_eval = True
 
         _log().info(
             f"[RolloutDispatcher] configured num_coordinators={num_coordinators}, "
@@ -450,17 +452,13 @@ class RolloutDispatcher:
     async def run(self, input_batch: TrajectoryRequestBatch, disable_tqdm: bool = False) -> TrajectoryBatch:
         """Route one group to one coordinator, await its TrajectoryBatch, and retain it.
 
-        Training: round-robin across all coordinators. Eval: pinned to shard 0
-        (the only coordinator with an active eval orchestrator). When a sink is attached, the returned batch
-        is retained here.
+        Training and eval groups both round-robin across all coordinators
+        (every coordinator holds an eval orchestrator while a session is
+        active). When a sink is attached, the returned batch is retained here.
         """
         del disable_tqdm
-        if self._eval_session_active:
-            coordinator_index = 0
-            actor = self._actors[0]
-        else:
-            coordinator_index = next(self._rr)
-            actor = self._actors[coordinator_index]
+        coordinator_index = next(self._rr)
+        actor = self._actors[coordinator_index]
         global_step = self._current_global_step()
         rpc = actor.run_shard.remote(input_batch, global_step)
         rpc_deadline = asyncio.timeout(self._coordinator_rpc_timeout)
@@ -497,19 +495,26 @@ class RolloutDispatcher:
         self._actors = []
 
     # ---- Eval session passthrough ----
-    # Eval routes through a SINGLE coordinator (shard 0) to keep eval-session
-    # orchestrator lifecycle simple and correct. Eval is gated off in production
-    # (eval_interval is effectively infinite), so this path is rarely exercised
-    # under fan-out; routing to one coordinator avoids fanning eval-session
-    # state across K orchestrators.
+    # Eval sessions are broadcast to EVERY coordinator so eval groups can
+    # round-robin across the full fan-out (a single pinned shard capped eval at
+    # n_concurrent_trials // K and starved training for the whole session).
+    # Safe to fan out: each runner builds its own per-session QueueOrchestrator,
+    # the eval trials_dir is deterministic and created with exist_ok=True, and
+    # metrics are computed trainer-side from the returned batches, so no
+    # per-coordinator state needs merging.
     async def start_eval_session(self, *, run_name: str, eval_step: int, val_set_name: str | None = None) -> None:
         if self._actors:
-            await self._actors[0].start_eval_session.remote(
-                run_name=run_name, eval_step=eval_step, val_set_name=val_set_name
+            await asyncio.gather(
+                *[
+                    actor.start_eval_session.remote(
+                        run_name=run_name, eval_step=eval_step, val_set_name=val_set_name
+                    )
+                    for actor in self._actors
+                ]
             )
             self._eval_session_active = True
 
     async def stop_eval_session(self) -> None:
         if self._actors:
-            await self._actors[0].stop_eval_session.remote()
+            await asyncio.gather(*[actor.stop_eval_session.remote() for actor in self._actors])
             self._eval_session_active = False
