@@ -19,6 +19,7 @@ from transformers import AutoTokenizer
 from collections import defaultdict
 
 import numpy as np
+from skyrl_train.curriculum import CurriculumSampler
 from skyrl_train.dataset import PromptDataset
 from skyrl_train.utils.tracking import Tracking
 from skyrl_train.training_batch import GLOBAL_LOSS_DENOM_METADATA_KEY, TrainingInputBatch, TrainingOutputBatch
@@ -615,6 +616,8 @@ class RayPPOTrainer:
                         # NOTE: We use instance_ids from `trajectory_ids` here instead of re-using `uids`
                         # this is because in step-wise training, len(uids) != len(trajectory_batch["response_ids"])
                         uids = [trajectory_id.instance_id for trajectory_id in trajectory_batch["trajectory_ids"]]
+
+                    self._update_curriculum_sampler(trajectory_batch, uids)
 
                     # dynamic sampling
                     if self.cfg.trainer.algorithm.dynamic_sampling.type is not None:
@@ -1433,6 +1436,30 @@ class RayPPOTrainer:
         # re-assign reward but now it's per token rewards
         trajectory_batch["rewards"] = per_token_rewards
         return trajectory_batch
+
+    def _update_curriculum_sampler(self, trajectory_batch: TrajectoryBatch, uids: List[str]) -> None:
+        """Feed this step's per-sample rewards to the curriculum sampler, if one is active.
+
+        Runs on the raw generated batch, before dynamic sampling filters uninformative
+        groups: the sampler must observe every group's outcome (including all-pass and
+        all-fail groups) or its statistics would be biased toward 100% informative. At
+        this point rewards are response-level floats; per-token reward lists are also
+        accepted, with each sample's scalar reward taken as their sum. The sampler only
+        compares rewards within one prompt's group, so any monotonic scalarization works.
+        """
+        sampler = self.train_dataloader.sampler if self.train_dataloader is not None else None
+        if not isinstance(sampler, CurriculumSampler):
+            return
+        rewards = [
+            float(np.sum(reward)) if isinstance(reward, list) else float(reward)
+            for reward in trajectory_batch["rewards"]
+        ]
+        if len(rewards) != len(uids):
+            raise ValueError(
+                f"Curriculum sampling needs one reward per sample: got {len(rewards)} rewards for {len(uids)} uids"
+            )
+        sampler.update(uids, rewards, self.cfg.generator.n_samples_per_prompt)
+        self.all_metrics.update(sampler.metrics())
 
     @torch.no_grad()
     def compute_advantages_and_returns(self, data: TrainingInputBatch) -> TrainingInputBatch:
