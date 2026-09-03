@@ -6,7 +6,6 @@ import threading
 import zipfile
 
 import pytest
-from omegaconf import OmegaConf
 
 from skyrl_train.trajectory_runners.base import (
     BatchMetadata,
@@ -15,7 +14,7 @@ from skyrl_train.trajectory_runners.base import (
     TrajectoryBatch,
     TrajectoryID,
 )
-from skyrl_train.fully_async_trainer import FullyAsyncRayPPOTrainer
+from skyrl_train.trajectory_runners.harbor.execution import HarborRunnerSpec, ProcessPoolResources
 from skyrl_train.trajectory_runners.harbor.rollout_dispatcher import RolloutDispatcher
 from skyrl_train.trajectory_runners.trajectory_processing import concatenate_trajectory_batches
 from skyrl_train.trajectory_runners.trajectory_retention import (
@@ -131,15 +130,17 @@ def _output() -> TrajectoryBatch:
         "rewards": [1.0, -0.25, 0.0],
         "unshaped_rewards": [1.0, 0.0, 0.0],
         "reward_shaping_components": [
-            {"non_termination": 0.0, "overlong": 0.0, "successful_length": 0.0},
-            {"non_termination": -0.25, "overlong": 0.0, "successful_length": 0.0},
-            {"non_termination": 0.0, "overlong": 0.0, "successful_length": 0.0},
+            {"passthrough": 0.0, "non_termination": 0.0, "overlong": 0.0, "successful_length": 0.0},
+            {"passthrough": -0.25, "non_termination": 0.0, "overlong": 0.0, "successful_length": 0.0},
+            {"passthrough": 0.0, "non_termination": 0.0, "overlong": 0.0, "successful_length": 0.0},
         ],
         "reward_shaping_loop_spans": [[], [], [{"start": 0, "end": 2}]],
         "loop_advantages": [[0.0, 0.0], [0.0, 0.0, 0.0], [-0.1, -0.1]],
         "reward_shaping_versions": [2, 2, 2],
         "loss_masks": [[1, 1], [1, 1, 1], [1, 1]],
         "stop_reasons": ["stop", "length", "stop"],
+        "exception_types": [None, "TurnCapExhaustedError", None],
+        "error_treatments": [None, "passthrough", None],
         "rollout_metrics": {"environment/score": 1 / 3},
         "rollout_logprobs": None,
         "trajectory_ids": [
@@ -162,6 +163,8 @@ _OUTPUT_BATCH_SEQUENCE_KEYS = (
     "reward_shaping_versions",
     "loss_masks",
     "stop_reasons",
+    "exception_types",
+    "error_treatments",
     "trajectory_ids",
 )
 
@@ -244,12 +247,60 @@ def test_normalized_output_produces_complete_core_trace_schema():
         "prompt",
         "response",
         "reward",
+        "disposition",
+        "verifier",
         "metrics",
         "provenance",
     }
     assert record["prompt"]["messages"] == [{"role": "user", "content": "first"}]
     assert record["response"]["text"] == "10 11"
+    assert record["verifier"] is None
+    assert record["schema_version"] == 3
+    assert record["disposition"] == {"exception_type": None, "error_treatment": None}
     assert record["provenance"]["runner"] == "SkyRLGymTrajectoryRunner"
+
+
+def test_verifier_tests_are_persisted_with_the_retained_trace():
+    output = _output()
+    output["verifier_tests"] = [
+        {
+            "parser": "pass_ratio_summary",
+            "complete": True,
+            "tests": [
+                {
+                    "record_id": "test-record-a",
+                    "trial_id": TrajectoryID(instance_id="a", repetition_id=0),
+                    "test_id": "test formatting",
+                    "outcome": "failed",
+                    "output": "test formatting: FAIL: expected title",
+                }
+            ],
+        },
+        None,
+        None,
+    ]
+
+    records = build_trajectory_records(
+        _input(),
+        output,
+        _config(Path("/unused")),
+        _Tokenizer(),
+        runner_name="HarborTrajectoryRunner",
+    )
+
+    assert records[0].to_json()["verifier"] == {
+        "parser": "pass_ratio_summary",
+        "complete": True,
+        "tests": [
+            {
+                "record_id": "test-record-a",
+                "trial_id": {"instance_id": "a", "repetition_id": 0},
+                "test_id": "test formatting",
+                "outcome": "failed",
+                "output": "test formatting: FAIL: expected title",
+            }
+        ],
+    }
 
 
 @pytest.mark.asyncio
@@ -297,6 +348,8 @@ def test_step_wise_rows_form_one_replayable_trajectory_with_explicit_boundaries(
             "reward_shaping_versions": None,
             "loss_masks": [[1], [1, 1]],
             "stop_reasons": ["tool", "stop"],
+            "exception_types": [None, None],
+            "error_treatments": [None, None],
             "trajectory_ids": [trajectory_id, trajectory_id],
             "is_last_step": [False, True],
         }
@@ -338,6 +391,8 @@ def test_step_wise_retention_aggregates_final_row_overlong_penalty():
             "reward_shaping_versions": [2, 2],
             "loss_masks": [[1], [1, 1]],
             "stop_reasons": ["tool", "stop"],
+            "exception_types": [None, None],
+            "error_treatments": [None, None],
             "trajectory_ids": [trajectory_id, trajectory_id],
             "is_last_step": [False, True],
         }
@@ -354,7 +409,7 @@ def test_step_wise_retention_aggregates_final_row_overlong_penalty():
     assert record["reward"] == {
         "outcome": 1.0,
         "shaped": 0.5,
-        "components": {"non_termination": 0.0, "overlong": -0.5, "successful_length": 0.0},
+        "components": {"passthrough": 0.0, "non_termination": 0.0, "overlong": -0.5, "successful_length": 0.0},
     }
 
 
@@ -369,7 +424,11 @@ def test_train_phase_retains_sample_and_anomalies(tmp_path):
     failed = next(record for record in records if record["trajectory"]["instance_id"] == "b")
     assert failed["reward"]["outcome"] == 0.0
     assert failed["reward"]["shaped"] == -0.25
-    assert failed["reward"]["components"]["non_termination"] == -0.25
+    assert failed["reward"]["components"]["passthrough"] == -0.25
+    assert failed["disposition"] == {
+        "exception_type": "TurnCapExhaustedError",
+        "error_treatment": "passthrough",
+    }
 
 
 def test_resume_is_idempotent_and_new_content_appends(tmp_path):
@@ -579,68 +638,44 @@ def test_initialization_reconciles_archive_written_before_ledger_commit(tmp_path
     assert len(list(tmp_path.rglob("*.zip"))) == 1
 
 
-class _FanoutCoordinator:
+class _ProcessCoordinator:
     """One coordinator actor that returns a finished batch, standing in for the Ray RPC."""
 
     def __init__(self):
-        self.run_shard = _FanoutRemote()
+        self.run_shard = _ProcessRemote()
 
 
-class _FanoutRemote:
-    def remote(self, *_args):
+class _ProcessRemote:
+    def remote(self, input_batch, *_args):
+        positions = {trajectory_id.to_string(): index for index, trajectory_id in enumerate(_input()["trajectory_ids"])}
+        indices = [positions[trajectory_id.to_string()] for trajectory_id in input_batch["trajectory_ids"]]
+        _, output = _select_batch_rows(indices)
         future = asyncio.get_running_loop().create_future()
-        future.set_result(_output())
+        future.set_result(output)
         return future
 
 
-def _fanout_dispatcher() -> RolloutDispatcher:
+def _process_dispatcher(harbor_runner_spec: HarborRunnerSpec) -> RolloutDispatcher:
     dispatcher = RolloutDispatcher(
-        cfg=OmegaConf.create({}),
-        trajectory_runner_cfg=OmegaConf.create({}),
-        terminal_bench_cfg=OmegaConf.create({}),
-        num_coordinators=1,
-        cpus_per_coordinator=1,
-        coordinator_rpc_timeout=30.0,
+        spec=harbor_runner_spec,
+        resources=ProcessPoolResources(1, 1, 1, 30),
     )
-    dispatcher._actors = [_FanoutCoordinator()]
+    dispatcher._actors = [_ProcessCoordinator()]
     return dispatcher
 
 
 @pytest.mark.asyncio
-async def test_fanout_retains_its_coordinators_batch_under_the_harbor_runner(tmp_path):
-    """Retention under fan-out, where the dispatcher replaced the runner the sink was attached to."""
-    dispatcher = _fanout_dispatcher()
+async def test_process_dispatcher_retains_its_coordinators_batch_under_the_harbor_runner(tmp_path, harbor_runner_spec):
+    """Retention when the process dispatcher replaces the runner the sink was attached to."""
+    dispatcher = _process_dispatcher(harbor_runner_spec)
     dispatcher.set_trajectory_sink(TrajectorySink(_config(tmp_path), _Tokenizer()))
 
     output = await dispatcher.run(_input())
 
     assert output["rollout_metrics"]["generate/trajectory_retention/written"] == 3.0
     assert {record["trajectory"]["instance_id"] for record in _records(tmp_path)} == {"a", "b", "c"}
-    # The proxy must not stamp its own name: retained provenance is identical with fan-out on or off.
+    # The proxy must not stamp its own name: retained provenance is independent of process placement.
     assert {record["provenance"]["runner"] for record in _records(tmp_path)} == {"HarborTrajectoryRunner"}
-
-
-@pytest.mark.asyncio
-async def test_enabling_fanout_keeps_the_already_attached_sink_working(tmp_path):
-    """Replacing the trajectory runner reattaches its retention sink."""
-    trainer = FullyAsyncRayPPOTrainer.__new__(FullyAsyncRayPPOTrainer)
-    trainer.cfg = OmegaConf.create(
-        {
-            "rollout": {"fanout": {"enabled": True, "num_coordinators": 1, "coordinator_rpc_timeout": 30.0}},
-            "terminal_bench_config": {},
-            "generator": {},
-        }
-    )
-    # Bound as RayPPOTrainer.__init__ leaves it: rebinding to a different name would raise.
-    trainer.trajectory_sink = TrajectorySink(_config(tmp_path), _Tokenizer())
-    trainer.trajectory_sink.bind_runner("HarborTrajectoryRunner")
-
-    trainer._maybe_enable_rollout_fanout()
-    trainer.trajectory_runner._actors = [_FanoutCoordinator()]
-    output = await trainer.trajectory_runner.run(_input())
-
-    assert output["rollout_metrics"]["generate/trajectory_retention/written"] == 3.0
-    assert len(_records(tmp_path)) == 3
 
 
 def test_retention_takes_the_run_id_the_initiator_set(monkeypatch):

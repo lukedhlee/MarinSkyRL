@@ -6,6 +6,7 @@ import pytest
 from types import SimpleNamespace
 
 from skyrl_train.trajectory_runners.trajectory_processing import (
+    AlignmentStats,
     apply_overlong_filtering,
     concatenate_trajectory_batches,
     minimum_captured_global_step,
@@ -934,6 +935,38 @@ def test_failure_metrics_survive_concatenation():
     assert merged["rollout_metrics"]["generate/errors/ContextLengthExceededError"] == 1
 
 
+def test_unaligned_logprob_alert_survives_concatenation():
+    groups = [_generated_group(1, 0), _generated_group(1, 0)]
+    clean = AlignmentStats()
+    clean.n_tokens = 10
+    clean.n_exact = 10
+    unaligned = AlignmentStats()
+    unaligned.n_tokens = 10
+    unaligned.n_exact = 9
+    unaligned.n_unaligned = 1
+    unaligned.n_failed_messages = 1
+    groups[0]["rollout_metrics"].update(clean.as_metrics(prefix="generate/tis/", lcs_alert_threshold=0.005))
+    groups[1]["rollout_metrics"].update(unaligned.as_metrics(prefix="generate/tis/", lcs_alert_threshold=0.005))
+
+    merged = concatenate_trajectory_batches(groups, tis_lcs_alert_threshold=0.005)
+
+    assert merged["rollout_metrics"]["generate/tis/unaligned_fraction"] == pytest.approx(0.05)
+    assert merged["rollout_metrics"]["generate/tis/lcs_fallback_alert"] == 0.0
+    assert merged["rollout_metrics"]["generate/tis/alignment_alert"] == 1.0
+
+
+def test_identity_aware_reward_metrics_survive_concatenation():
+    groups = [_generated_group(2, 0), _generated_group(2, 0)]
+    groups[0]["rollout_metrics"]["generate/reward_shaping/identity_aware/groups"] = 1
+    groups[1]["rollout_metrics"]["generate/reward_shaping/identity_aware/groups"] = 1
+    groups[1]["rollout_metrics"]["generate/reward_shaping/identity_aware/fallback_groups"] = 1
+
+    merged = concatenate_trajectory_batches(groups, tis_lcs_alert_threshold=0.005)
+
+    assert merged["rollout_metrics"]["generate/reward_shaping/identity_aware/groups"] == 2
+    assert merged["rollout_metrics"]["generate/reward_shaping/identity_aware/fallback_groups"] == 1
+
+
 def test_generators_that_report_no_trials_get_no_failure_series():
     # Only the agentic generator counts trials, and a fabricated zero series for
     # every other generator would read as a measured "nothing failed".
@@ -970,6 +1003,39 @@ def test_required_rollout_logprobs_reject_partial_generation_batch():
     with pytest.raises(ValueError, match="rollout_logprobs are required"):
         concatenate_trajectory_batches(
             [with_logprobs, _generated_group(2, 0)],
+            require_rollout_logprobs=True,
+            tis_lcs_alert_threshold=0.005,
+        )
+
+
+def test_required_rollout_logprobs_allow_fully_excluded_generation_batch():
+    trainable = {**_generated_group(2, 0), "rollout_logprobs": [[-0.1, -0.2], [-0.3, -0.4]]}
+    excluded = {
+        **_generated_group(2, 2),
+        "loss_masks": [[0, 0], [0, 0]],
+        "exclude_from_baseline": [True, True],
+    }
+
+    merged = concatenate_trajectory_batches(
+        [trainable, excluded],
+        require_rollout_logprobs=True,
+        tis_lcs_alert_threshold=0.005,
+    )
+
+    assert merged["loss_masks"] == [[1, 1], [1, 1], [0, 0], [0, 0]]
+    assert merged["exclude_from_baseline"] == [False, False, True, True]
+
+
+def test_required_rollout_logprobs_reject_fully_masked_baseline_contributor():
+    masked_baseline_contributor = {
+        **_generated_group(2, 0),
+        "loss_masks": [[0, 0], [0, 0]],
+        "exclude_from_baseline": [False, False],
+    }
+
+    with pytest.raises(ValueError, match="rollout_logprobs are required"):
+        concatenate_trajectory_batches(
+            [masked_baseline_contributor],
             require_rollout_logprobs=True,
             tis_lcs_alert_threshold=0.005,
         )

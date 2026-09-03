@@ -19,6 +19,7 @@ from transformers import AutoTokenizer
 from collections import defaultdict
 
 import numpy as np
+from skyrl_train.curriculum import CurriculumSampler
 from skyrl_train.dataset import PromptDataset
 from skyrl_train.utils.tracking import Tracking
 from skyrl_train.training_batch import GLOBAL_LOSS_DENOM_METADATA_KEY, TrainingInputBatch, TrainingOutputBatch
@@ -58,7 +59,17 @@ from skyrl_train.distributed.dispatch import (
 from skyrl_train.workers.worker import PPORayActorGroup
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
-from skyrl_train.group_admission import GroupAdvantageInvariant, assert_training_groups_eligible
+from skyrl_train.group_admission import (
+    AdmissionRejection,
+    GroupAdvantageInvariant,
+    assert_training_groups_eligible,
+)
+from skyrl_train.sync_group_admission import (
+    GroupAdmissionSamplingResult,
+    GroupAdmissionSamplingState,
+    InsufficientEligibleGroupsError,
+    admit_or_collect_replacements,
+)
 from skyrl_train.dynamic_sampling import resolve_dynamic_sampling_criteria
 from marinskyrl.checkpoint_paths import GLOBAL_STEP_PREFIX, LATEST_CHECKPOINT_FILE
 from skyrl_train.checkpoint_listing import extract_step_from_path
@@ -151,6 +162,7 @@ class RayPPOTrainer:
         self._checkpoint_save_failures = 0.0
         self._shutdown_complete = False
         self.global_step = 0
+        self._last_saved_step: int | None = None
 
         # initialized in `build_models`
         self.policy_model: PPORayActorGroup = None
@@ -160,6 +172,7 @@ class RayPPOTrainer:
         self._node_ids: Optional[List[str]] = None
 
         self.dynamic_sampling_state: Optional[DynamicSamplingState] = None
+        self.group_admission_state: Optional[GroupAdmissionSamplingState] = None
 
         self.reward_kl_controller: Optional[Union[FixedKLController, AdaptiveKLController]] = None
         configure_ray_worker_logging()
@@ -434,7 +447,8 @@ class RayPPOTrainer:
                 await self.inference_engine_client.sleep()
                 self.policy_model.backload_to_gpu()
 
-            if self._control.should_save:
+            # The interval save may have just written this same step; do not write it twice.
+            if self._control.should_save and self._last_saved_step != self.global_step:
                 with Timer("save_checkpoints", self.all_timings):
                     await asyncio.to_thread(self.save_checkpoints)
                     logger.info("Saved final checkpoint.")
@@ -494,6 +508,9 @@ class RayPPOTrainer:
                 finally:
                     await self._sync_weights_and_restore_rollout_residency()
             else:
+                if self.cfg.trainer.offload_optimizer_during_rollouts:
+                    with Timer("offload_policy_optimizer_to_cpu", self.all_timings):
+                        self.policy_model.offload_to_cpu(offload_optimizer=True, offload_model=False)
                 with Timer("sync_weights", self.all_timings):
                     ray.get(self.sync_policy_weights_to_inference_engines())
         self._log_weight_update_completed(reason=reason, duration_seconds=update_timer.duration)
@@ -616,6 +633,15 @@ class RayPPOTrainer:
                         # NOTE: We use instance_ids from `trajectory_ids` here instead of re-using `uids`
                         # this is because in step-wise training, len(uids) != len(trajectory_batch["response_ids"])
                         uids = [trajectory_id.instance_id for trajectory_id in trajectory_batch["trajectory_ids"]]
+
+                    self._update_curriculum_sampler(trajectory_batch, uids)
+
+                    admission = self.handle_group_admission(trajectory_batch, uids)
+                    trajectory_batch = admission.trajectory_batch
+                    uids = admission.uids
+                    if admission.keep_sampling:
+                        pbar.update(1)
+                        continue
 
                     # dynamic sampling
                     if self.cfg.trainer.algorithm.dynamic_sampling.type is not None:
@@ -1478,6 +1504,30 @@ class RayPPOTrainer:
         except Exception as e:
             logger.warning(f"rollout diagnostics failed (non-fatal): {e}")
 
+    def _update_curriculum_sampler(self, trajectory_batch: TrajectoryBatch, uids: List[str]) -> None:
+        """Feed this step's per-sample rewards to the curriculum sampler, if one is active.
+
+        Runs on the raw generated batch, before dynamic sampling filters uninformative
+        groups: the sampler must observe every group's outcome (including all-pass and
+        all-fail groups) or its statistics would be biased toward 100% informative. At
+        this point rewards are response-level floats; per-token reward lists are also
+        accepted, with each sample's scalar reward taken as their sum. The sampler only
+        compares rewards within one prompt's group, so any monotonic scalarization works.
+        """
+        sampler = self.train_dataloader.sampler if self.train_dataloader is not None else None
+        if not isinstance(sampler, CurriculumSampler):
+            return
+        rewards = [
+            float(np.sum(reward)) if isinstance(reward, list) else float(reward)
+            for reward in trajectory_batch["rewards"]
+        ]
+        if len(rewards) != len(uids):
+            raise ValueError(
+                f"Curriculum sampling needs one reward per sample: got {len(rewards)} rewards for {len(uids)} uids"
+            )
+        sampler.update(uids, rewards, self.cfg.generator.n_samples_per_prompt)
+        self.all_metrics.update(sampler.metrics())
+
     @torch.no_grad()
     def compute_advantages_and_returns(self, data: TrainingInputBatch) -> TrainingInputBatch:
         """Calculate advantages and returns for the data batch.
@@ -1941,6 +1991,9 @@ class RayPPOTrainer:
                     operation="policy ppo_train",
                 )
         else:
+            if self.cfg.trainer.offload_optimizer_during_rollouts:
+                with Timer("backload_policy_optimizer_to_gpu", self.all_timings):
+                    self.policy_model.backload_to_gpu(backload_optimizer=True, backload_model=False)
             if self.critic_model is not None:
                 with Timer("policy_critic_overlap_train", self.all_timings):
                     policy_refs = self.policy_model.async_run_ray_method("mesh", "ppo_train", data)
@@ -2041,6 +2094,61 @@ class RayPPOTrainer:
 
         return result
 
+    def handle_group_admission(
+        self, trajectory_batch: TrajectoryBatch, uids: List[str]
+    ) -> GroupAdmissionSamplingResult:
+        """Hold synchronous training until a complete eligible group batch is available."""
+        if self.group_admission_state is None:
+            self.group_admission_state = {"sample_batch_count": 1}
+        else:
+            self.group_admission_state["sample_batch_count"] += 1
+
+        result = admit_or_collect_replacements(
+            trajectory_batch,
+            uids,
+            invariant=self.group_advantage_invariant,
+            rollout_logprobs_required=policy_loss_requires_rollout_logprobs(
+                self.cfg.trainer.algorithm.policy_loss_type
+            ),
+            target_batch_size=int(self.cfg.trainer.train_batch_size),
+            tis_lcs_alert_threshold=float(self.cfg.trainer.algorithm.tis_lcs_alert_threshold),
+            state=self.group_admission_state,
+        )
+        rejected_count = sum(result.rejection_counts.values())
+        self.all_metrics.update(
+            {
+                "sync/admission/rejected_count": float(rejected_count),
+                "sync/admission/rejected_rate": rejected_count / max(result.inspected_count, 1),
+                **{
+                    f"sync/admission/rejected_count/{reason.value}": float(result.rejection_counts[reason])
+                    for reason in AdmissionRejection
+                },
+            }
+        )
+
+        max_sample_batches = int(self.cfg.trainer.algorithm.group_admission.max_sample_batches)
+        if (
+            result.keep_sampling
+            and max_sample_batches > 0
+            and self.group_admission_state["sample_batch_count"] >= max_sample_batches
+        ):
+            accepted_count = int(self.group_admission_state.get("num_prompts_in_batch", 0))
+            raise InsufficientEligibleGroupsError(
+                f"Synchronous generation collected {accepted_count} of {self.cfg.trainer.train_batch_size} "
+                f"eligible groups after {max_sample_batches} batches; rejections="
+                f"{self.group_admission_state.get('rejection_counts', {})}"
+            )
+
+        self.group_admission_state = result.state
+        if rejected_count:
+            rejection_summary = {reason.value: count for reason, count in result.rejection_counts.items() if count}
+            logger.warning(
+                f"Rejected synchronous rollout groups before step {self.global_step}; "
+                f"reasons={rejection_summary}. "
+                f"Waiting for a complete {self.cfg.trainer.train_batch_size}-group replacement batch."
+            )
+        return result
+
     def _get_dp_group_models(self, rank: int, model_type: str = ""):
         model = getattr(self, model_type)
         return model._actor_handlers[rank]
@@ -2118,6 +2226,7 @@ class RayPPOTrainer:
             f.write(str(self.global_step))
 
         logger.info(f"Successfully saved checkpoint for global_step_{self.global_step} to: {global_step_folder}")
+        self._last_saved_step = self.global_step
 
         # Clean up old checkpoints after successful save
         with Timer("cleanup_old_checkpoints", self.all_timings):

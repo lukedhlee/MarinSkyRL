@@ -18,8 +18,13 @@ from skyrl_gym.verification import (
 from loguru import logger
 from uuid import uuid4
 from skyrl_train.trajectory_runners.base import TrajectoryRunner, TrajectoryRequestBatch, TrajectoryBatch, TrajectoryID
-from skyrl_train.trajectory_runners.projections import project_loss_mask
-from skyrl_train.metric_names import TIS_LCS_FALLBACK_ALERT_METRIC, TIS_METRIC_PREFIX
+from skyrl_train.trajectory_runners.types import VerifierTestCollection
+from skyrl_train.trajectory_runners.projections import attach_terminal_classifications, project_loss_mask
+from skyrl_train.metric_names import (
+    IDENTITY_AWARE_REWARD_METRIC_PREFIX,
+    TIS_ALIGNMENT_ALERT_METRIC,
+    TIS_METRIC_PREFIX,
+)
 from skyrl_train.trajectory_runners.trajectory_processing import (
     BATCH_ERROR_METRIC_PREFIX,
     get_batch_failure_metrics,
@@ -36,8 +41,13 @@ from skyrl_train.trajectory_runners.trajectory_processing import (
     _sentinel_routed_experts_row,
     SENTINEL_EXPERT_ID,
 )
-from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
-from skyrl_train.utils.reward_shaping import shape_reward_from_output, shape_reward_with_components
+from skyrl_train.utils.reward_shaping import (
+    ParsedTestResult,
+    parse_test_output_with_parser,
+    shape_reward_from_output,
+    shape_reward_with_components,
+    verifier_test_collection,
+)
 from skyrl_train.utils.harbor_errors import (
     ErrorTreatment,
     classify_exception_type,
@@ -61,10 +71,15 @@ from skyrl_train.trajectory_runners.harbor._harbor_compat import (
 from harbor.models.trial.config import TrialConfig
 from harbor.models.trial.result import TrialResult
 from harbor.utils.traces_utils import normalize_message
+from harbor.verifier.verifier import VerifierOutputParseError
 
 # Schema-driven Harbor config mapping
 from skyrl_train.trajectory_runners.harbor.configuration import HarborConfigBuilder
 from skyrl_train.trajectory_runners.harbor.contracts import verification_from_harbor_result
+from skyrl_train.trajectory_runners.harbor.identity_aware_reward import (
+    IDENTITY_AWARE_SHAPER,
+    identity_aware_pass_ratios,
+)
 from skyrl_train.trajectory_runners.harbor.truncation_penalty import apply_truncation_penalty, detect_turn_truncation
 
 # Incremental, trial-indexed reader for the shared opencode literal log.
@@ -207,6 +222,7 @@ class TerminalBenchAgentOutput:
     disposition: TrainingDisposition
     loss_mask: List[int]
     trajectory_id: TrajectoryID
+    verifier_tests: Optional[VerifierTestCollection] = None
     summarization_count: Optional[int] = None
     # TIS logprob-alignment bookkeeping (exact-vs-LCS-vs-failed token counts).
     # Aggregated into rollout_metrics as tis/* so an LCS fallback or alignment
@@ -217,6 +233,7 @@ class TerminalBenchAgentOutput:
     # True when the truncation penalty was applied (stop_reason=="length" +
     # original_reward==0 + truncation_penalty>0). Counted into rollout_metrics.
     truncation_penalized: bool = False
+    error_treatment: str | None = None
 
 
 def _failed_agent_output(
@@ -289,12 +306,13 @@ def _completed_disposition(
     preserve_timeout: bool,
     preserve_exclude_from_baseline: bool,
     preserve_exception_type: Optional[str],
+    terminal_exception_type: Optional[str],
 ) -> TrainingDisposition:
     return TrainingDisposition(
         loss_eligible=True,
         baseline_eligible=not preserve_exclude_from_baseline if preserve_timeout else True,
         reason=f"preserved {preserve_exception_type}" if preserve_timeout else "verified",
-        exception_type=preserve_exception_type if preserve_timeout else None,
+        exception_type=terminal_exception_type,
     )
 
 
@@ -319,7 +337,6 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         self,
         trajectory_runner_cfg: DictConfig,
         terminal_bench_cfg: DictConfig,
-        inference_engine_client: InferenceEngineClient,
         tokenizer,
         tis_lcs_alert_threshold: float,
         moe_router_replay: bool = False,
@@ -331,7 +348,6 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         Args:
             trajectory_runner_cfg: trajectory-runner configuration
             terminal_bench_cfg: DictConfig object containing the terminal bench configuration
-            inference_engine_client: InferenceEngineClient object for interacting with the inference engines
             tokenizer: tokenizer object for encoding and decoding text
             moe_router_replay: when True, capture per-token MoE routed_experts from
                 Harbor rollout_details and plumb them through to the training batch
@@ -419,6 +435,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
 
         # Reward shaping config (parses test output for partial credit)
         self._reward_shaping_config = self._harbor_config_builder.get_reward_shaping_config()
+        self._reward_shaping_enabled = bool(self._reward_shaping_config.get("enable_reward_shaping", True))
 
         # Loop-behavior reward shaping (Stage B / F5 + F4): master gate for the
         # per-token shaping channel + span tagger. Default False -> the runner
@@ -470,10 +487,12 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             f"HarborTrajectoryRunner initialized with HarborConfigBuilder. "
             f"Exposed fields: {list(self._harbor_config_builder._harbor_cfg.keys())}. "
             f"Retry config: max_retries={self._retry_config.max_retries}, "
-            f"backoff={self._retry_config.min_wait_sec}-{self._retry_config.max_wait_sec}s. "
+            f"backoff={self._retry_config.min_wait_sec}-{self._retry_config.max_wait_sec}s, "
+            f"include_exceptions={sorted(self._retry_config.include_exceptions or ())}, "
+            f"exclude_exceptions={sorted(self._retry_config.exclude_exceptions or ())}. "
             f"Concurrent trials: {self._n_concurrent_trials}. "
-            f"Reward shaping: enabled={self._reward_shaping_config.get('enable_reward_shaping', True)}, "
-            f"shaper={self._reward_shaping_config.get('reward_shaper', 'pass_ratio')}. "
+            f"Reward shaping: enabled={self._reward_shaping_enabled}, "
+            f"shaper={self._reward_shaping_config.get('reward_shaper', IDENTITY_AWARE_SHAPER)}. "
             f"Error classification: enabled={self._error_handling_config.enable_error_classification}"
         )
 
@@ -1156,6 +1175,8 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 else:
                     successful_outputs.append(output)
 
+        identity_aware_metrics = self._apply_identity_aware_reward_shaping(all_outputs)
+
         # Calculate rollout metrics for successful outputs
         if len(successful_outputs) > 0:
             rollout_metrics = get_rollout_metrics(
@@ -1198,6 +1219,7 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 num_masked_trajectories=num_masked_trajectories,
             )
         )
+        rollout_metrics.update(identity_aware_metrics)
 
         # TIS logprob-alignment metrics (aggregated across all trajectories with
         # logprobs). These make an LCS fallback or alignment failure ALWAYS visible
@@ -1221,10 +1243,9 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             )
             rollout_metrics.update(align_metrics)
             if batch_align.n_lcs_messages > 0 or batch_align.n_failed_messages > 0:
-                # Metered LCS defensive guard: escalate to ERROR when the alert metric
-                # trips (lcs_fallback_fraction over the configured threshold),
-                # else WARNING. Under full TITO this should never fire.
-                alert = align_metrics.get(TIS_LCS_FALLBACK_ALERT_METRIC, 0.0) >= 1.0
+                # Escalate to ERROR for any unaligned token or when complete LCS
+                # fallback use exceeds the configured threshold.
+                alert = align_metrics.get(TIS_ALIGNMENT_ALERT_METRIC, 0.0) >= 1.0
                 log_fn = logger.error if alert else logger.warning
                 log_fn(
                     f"TIS alignment{' ALERT' if alert else ''}: "
@@ -1421,6 +1442,9 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             "exclude_from_baseline": [not output.disposition.baseline_eligible for output in all_outputs],
             "actual_global_step": actual_global_step,
         }
+        attach_terminal_classifications(trajectory_batch, all_outputs)
+        if self._reward_shaping_enabled:
+            trajectory_batch["verifier_tests"] = [output.verifier_tests for output in all_outputs]
 
         # Only attach routed_experts when router-replay is on, so the flag-off
         # TrajectoryBatch dict is byte-identical to today (key absent, not None).
@@ -1655,6 +1679,28 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         )
         return chat_history
 
+    def _collect_verifier_test_evidence(
+        self,
+        result: TrialResult,
+        trajectory_id: TrajectoryID,
+        *,
+        preserve_timeout: bool,
+    ) -> tuple[Optional[ParsedTestResult], Optional[VerifierTestCollection]]:
+        """Parse and identify verifier tests when shaping can consume them."""
+        if preserve_timeout or not self._reward_shaping_enabled:
+            return None, None
+        verifier_stdout = getattr(result.verifier_result, "stdout", None)
+        parsed_tests, parser_name = parse_test_output_with_parser(
+            verifier_stdout or "",
+            self._reward_shaping_config.get("reward_parser"),
+        )
+        return parsed_tests, verifier_test_collection(
+            parsed_tests,
+            parser_name=parser_name,
+            instance_id=trajectory_id.instance_id,
+            repetition_id=trajectory_id.repetition_id,
+        )
+
     def _shape_harbor_reward(
         self,
         result: TrialResult,
@@ -1663,8 +1709,9 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         trajectory_id: TrajectoryID,
         *,
         preserve_timeout: bool,
+        parsed_tests: Optional[ParsedTestResult],
     ) -> RewardResult:
-        """Adapt a Harbor verdict and configured shaper to the shared reward contract."""
+        """Apply the configured per-trial shaper before any group-aware shaping."""
         if preserve_timeout:
             return RewardResult(unshaped_reward=None, optimization_reward=0.0)
 
@@ -1673,11 +1720,20 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         original_reward = verification.score
         reward = original_reward
         reward_components: Optional[Dict[str, float]] = None
-        if self._reward_shaping_config.get("enable_reward_shaping", True):
+        if self._reward_shaping_enabled:
             verifier_stdout = getattr(result.verifier_result, "stdout", None)
-            shaper_name = self._reward_shaping_config.get("reward_shaper", "pass_ratio")
+            shaper_name = self._reward_shaping_config.get("reward_shaper", IDENTITY_AWARE_SHAPER)
             shaper_kwargs = self._reward_shaping_config.get("shaper_kwargs", {})
-            if shaper_name in ("composite", "composite_loop"):
+            if shaper_name == IDENTITY_AWARE_SHAPER:
+                if parsed_tests is None:
+                    if not self._reward_shaping_config.get("reward_shaping_fallback", True):
+                        raise ValueError(
+                            f"could not parse verifier output with parser="
+                            f"{self._reward_shaping_config.get('reward_parser') or 'auto'}"
+                        )
+                else:
+                    reward = parsed_tests.pass_ratio
+            elif shaper_name in ("composite", "composite_loop"):
                 trajectory_context = (
                     detect_termination_signals(chat_history, original_reward)
                     if shaper_name == "composite_loop"
@@ -1712,6 +1768,57 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             optimization_reward=reward,
             components={} if reward_components is None else reward_components,
         )
+
+    def _apply_identity_aware_reward_shaping(
+        self,
+        all_outputs: List[TerminalBenchAgentOutput],
+    ) -> Dict[str, float]:
+        """Mutate group rewards in place and return their rollout metrics.
+
+        An empty mapping means the identity-aware shaper is inactive.
+        """
+        if (
+            not self._reward_shaping_enabled
+            or self._reward_shaping_config.get("reward_shaper", IDENTITY_AWARE_SHAPER) != IDENTITY_AWARE_SHAPER
+        ):
+            return {}
+
+        groups: Dict[str, List[TerminalBenchAgentOutput]] = {}
+        for output in all_outputs:
+            groups.setdefault(output.trajectory_id.instance_id, []).append(output)
+
+        shaper_kwargs = self._reward_shaping_config.get("shaper_kwargs", {})
+        exact_weights = shaper_kwargs.get("test_weights") or {}
+        metrics = {
+            f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/groups": float(len(groups)),
+            f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/fallback_groups": 0.0,
+            f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/zero_informative_groups": 0.0,
+            f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/informative_tests": 0.0,
+        }
+        for outputs in groups.values():
+            aggregate_rewards = [
+                output.reward_result.optimization_reward
+                + (self._truncation_penalty if output.truncation_penalized else 0.0)
+                for output in outputs
+            ]
+            result = identity_aware_pass_ratios(
+                [output.verifier_tests for output in outputs],
+                aggregate_rewards,
+                [output.disposition.baseline_eligible for output in outputs],
+                exact_weights=exact_weights,
+            )
+            for output, reward in zip(outputs, result.rewards, strict=True):
+                if output.truncation_penalized:
+                    reward -= self._truncation_penalty
+                output.reward_result = replace(output.reward_result, optimization_reward=reward)
+            metrics[f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/informative_tests"] += result.informative_test_count
+            if result.fallback_reason is not None:
+                metrics[f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/fallback_groups"] += 1
+                reason_metric = f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/fallback/{result.fallback_reason.value}"
+                metrics[reason_metric] = metrics.get(reason_metric, 0.0) + 1
+            elif result.informative_test_count == 0:
+                metrics[f"{IDENTITY_AWARE_REWARD_METRIC_PREFIX}/zero_informative_groups"] += 1
+        return metrics
 
     def _process_trial_result(
         self,
@@ -1756,6 +1863,8 @@ class HarborTrajectoryRunner(TrajectoryRunner):
         preserve_timeout = False
         preserve_exclude_from_baseline = False
         preserve_exception_type: Optional[str] = None
+        terminal_exception_type: Optional[str] = None
+        terminal_error_treatment: ErrorTreatment | None = None
 
         # Check for exception_info - Harbor may return both exception_info AND
         # verifier_result when a trial had an error (e.g., AgentTimeoutError,
@@ -1770,6 +1879,8 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 exception_type = type(exception_info).__name__
 
             treatment, _ = self._classify_exception_type(exception_type)
+            terminal_exception_type = exception_type
+            terminal_error_treatment = treatment
 
             # Passthrough: ignore the exception and fall through to normal
             # verifier processing. The agent hit a soft limit (timeout, context
@@ -1913,13 +2024,22 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 exclude_from_baseline=exclude_from_baseline,
             )
 
-        reward_result = self._shape_harbor_reward(
-            result,
-            verification,
-            chat_history,
-            trajectory_id,
-            preserve_timeout=preserve_timeout,
-        )
+        try:
+            parsed_tests, verifier_tests = self._collect_verifier_test_evidence(
+                result,
+                trajectory_id,
+                preserve_timeout=preserve_timeout,
+            )
+            reward_result = self._shape_harbor_reward(
+                result,
+                verification,
+                chat_history,
+                trajectory_id,
+                preserve_timeout=preserve_timeout,
+                parsed_tests=parsed_tests,
+            )
+        except ValueError as error:
+            raise VerifierOutputParseError("could not interpret verifier output for reward shaping") from error
         original_reward = reward_result.unshaped_reward or 0.0
         reward = reward_result.optimization_reward
 
@@ -2040,13 +2160,16 @@ class HarborTrajectoryRunner(TrajectoryRunner):
                 tis_splice=self._tis_splice,
             )
 
-        # Determine stop reason
+        # Prefer the agent's terminal reason when Harbor supplied one. The local
+        # response limit remains authoritative when the reconstructed response
+        # itself exceeds the configured budget.
         max_response_tokens = (
             self.trajectory_runner_cfg.sampling_params.max_generate_length
             + self.trajectory_runner_cfg.max_input_length
             - initial_prompt_length
         )
-        stop_reason = "complete"  # Default for trial completion
+        raw_agent_stop_reason = metadata.get("stop_reason") if isinstance(metadata, dict) else None
+        stop_reason = str(raw_agent_stop_reason).strip().lower() if raw_agent_stop_reason else "complete"
         if len(response_ids) > max_response_tokens:
             stop_reason = "length"
 
@@ -2171,11 +2294,13 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             preserve_timeout=preserve_timeout,
             preserve_exclude_from_baseline=preserve_exclude_from_baseline,
             preserve_exception_type=preserve_exception_type,
+            terminal_exception_type=terminal_exception_type,
         )
         return TerminalBenchAgentOutput(
             evidence=evidence,
             verification=verification,
             reward_result=reward_result,
+            verifier_tests=verifier_tests,
             disposition=disposition,
             loss_mask=loss_mask,
             trajectory_id=trajectory_id,
@@ -2183,4 +2308,5 @@ class HarborTrajectoryRunner(TrajectoryRunner):
             alignment_stats=alignment_stats,
             response_span_tags=response_span_tags,
             truncation_penalized=truncation_penalized,
+            error_treatment=None if terminal_error_treatment is None else terminal_error_treatment.value,
         )

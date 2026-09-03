@@ -17,9 +17,11 @@ from omegaconf import OmegaConf
 try:
     from skyrl_train.trajectory_runners.harbor.configuration import (
         AGENT_SCHEMA,
+        REWARD_SHAPING_SCHEMA,
         HarborConfigBuilder,
         get_exposed_harbor_fields,
     )
+    from skyrl_train.trajectory_runners.harbor.identity_aware_reward import IDENTITY_AWARE_SHAPER
 except ImportError:
     pytest.skip("harbor deps unavailable (agentic RL extra not installed)", allow_module_level=True)
 
@@ -33,6 +35,10 @@ def _agent_kwargs(harbor_cfg: dict) -> dict:
 def test_schema_defaults_are_hygienic():
     assert AGENT_SCHEMA.fields["record_terminal_session"].default is False
     assert AGENT_SCHEMA.fields["trajectory_config"].default == {"raw_content": True}
+
+
+def test_identity_aware_reward_shaping_is_the_default_strategy():
+    assert REWARD_SHAPING_SCHEMA.fields["reward_shaper"].default == IDENTITY_AWARE_SHAPER
 
 
 def test_omitted_keys_get_defaults():
@@ -58,6 +64,12 @@ def test_max_turns_reaches_the_agent_without_deprecated_max_episodes():
     assert "max_episodes" not in kwargs
 
 
+def test_llm_call_kwargs_reach_the_agent():
+    kwargs = _agent_kwargs({"name": "terminus-2", "llm_call_kwargs": {"max_tokens": 4096}})
+
+    assert kwargs["llm_call_kwargs"] == {"max_tokens": 4096}
+
+
 def test_passthrough_exceptions_are_never_retried():
     cfg = OmegaConf.create(
         {
@@ -70,7 +82,18 @@ def test_passthrough_exceptions_are_never_retried():
 
     retry_config = HarborConfigBuilder(cfg).build_retry_config()
 
-    assert retry_config.exclude_exceptions == {"AgentTimeoutError", "VerifierTimeoutError"}
+    assert {
+        "AgentTimeoutError",
+        "OutputLengthExceededError",
+        "TurnCapExhaustedError",
+        "VerifierTimeoutError",
+    } <= retry_config.exclude_exceptions
+
+
+def test_default_taxonomy_passthrough_exceptions_are_terminal_without_campaign_duplication():
+    retry_config = HarborConfigBuilder(OmegaConf.create({"harbor": {"max_retries": 3}})).build_retry_config()
+
+    assert {"OutputLengthExceededError", "TurnCapExhaustedError"} <= retry_config.exclude_exceptions
 
 
 @pytest.mark.parametrize(
@@ -103,3 +126,10 @@ def test_trial_attempt_timeout_reaches_harbor_trial_config():
 
 def test_trial_attempt_timeout_remains_unset_when_omitted():
     assert _trial_config({}).trial_attempt_timeout_sec is None
+
+
+def test_daytona_ttl_reaches_harbor_environment_config():
+    trial_config = _trial_config({"ttl_minutes": 90})
+
+    assert trial_config.environment.kwargs["ttl_minutes"] == 90
+    assert "ttl_minutes" in get_exposed_harbor_fields()["environment"]

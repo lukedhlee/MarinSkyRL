@@ -64,6 +64,7 @@ DIAG_TRAINER_FIELDS = {
 }
 RUNTIME_CONFIG_TRAINER_FIELDS = {
     "collective_phase_diagnostics": False,
+    "offload_optimizer_during_rollouts": False,
     "distributed": {
         "placement_group_timeout_seconds": 180,
         "worker_collective_timeout_seconds": 1800,
@@ -88,6 +89,9 @@ ADDITIVE_DYNAMIC_SAMPLING_FIELDS = {
     "informative_on": "shaped",
     "min_reward_std": 0.0,
 }
+ADDITIVE_GROUP_ADMISSION_FIELDS = {
+    "max_sample_batches": 30,
+}
 ADDITIVE_OVERLONG_FIELDS = {
     "penalty_scale": 1.0,
 }
@@ -99,7 +103,6 @@ ADDITIVE_GENERATOR_FIELDS = {
     "engine_init_timeout_seconds": 1800,
     "r3_transport": "decentral",
     "r3_dispatch_put_timeout_seconds": 600,
-    "coordinator_executor_workers": 256,
     "gdn_backend": "torch",
 }
 ADDITIVE_TEACHER_FIELDS = {
@@ -125,6 +128,12 @@ EXPERT_LOADER_FIELDS = {
 }
 ADDITIVE_TRAINING_OPTIMIZER_FIELDS = {
     "fsdp_parameter_storage_dtype": None,
+}
+# Additive curriculum-sampling subtree under `data`. Default `kind: null` keeps
+# the stock shuffled sampler, so the tree is behavior-preserving and stripped
+# before the structural-identity comparison against the pre-CP golden.
+ADDITIVE_DATA_FIELDS = {
+    "sampling": None,
 }
 
 
@@ -169,6 +178,10 @@ def test_all_defaults_is_structurally_identical_to_baseline():
         container["trainer"]["algorithm"].pop(k, None)
     for k in ADDITIVE_DYNAMIC_SAMPLING_FIELDS:
         container["trainer"]["algorithm"]["dynamic_sampling"].pop(k, None)
+    for k in ADDITIVE_GROUP_ADMISSION_FIELDS:
+        container["trainer"]["algorithm"]["group_admission"].pop(k, None)
+    if not container["trainer"]["algorithm"]["group_admission"]:
+        container["trainer"]["algorithm"].pop("group_admission")
     for k in ADDITIVE_GENERATOR_FIELDS:
         container["generator"].pop(k, None)
     for k in ADDITIVE_TEACHER_FIELDS:
@@ -179,10 +192,14 @@ def test_all_defaults_is_structurally_identical_to_baseline():
         container["trainer"]["policy"].pop(k, None)
     for k in ADDITIVE_OVERLONG_FIELDS:
         container["generator"]["trajectory_reward_shaping"]["overlong"].pop(k, None)
+    for k in ADDITIVE_DATA_FIELDS:
+        container["data"].pop(k, None)
     container["trainer"]["placement"].pop("enable_numa_affinity", None)
     container["trainer"]["policy"].pop("host_memory_monitor", None)
     container["trainer"]["algorithm"].pop("tis_splice", None)
     container["trainer"]["algorithm"].pop("tis_lcs_alert_threshold", None)
+    container["trainer"]["algorithm"].pop("group_admission", None)
+    container["trainer"]["policy"]["megatron_config"].pop("check_train_eval_parity", None)
     golden = OmegaConf.to_container(OmegaConf.load(GOLDEN), resolve=False, throw_on_missing=False)
     assert container == golden, "default config drifted from the no-CP baseline"
 

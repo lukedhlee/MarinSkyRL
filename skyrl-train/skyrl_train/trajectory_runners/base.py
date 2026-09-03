@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from types import MappingProxyType
 from skyrl_train.metric_names import (
     TIS_ALIGNED_TOKENS_METRIC,
+    TIS_ALIGNMENT_ALERT_METRIC,
     TIS_ALIGNMENT_FAIL_COUNT_METRIC,
     TIS_EXACT_MATCH_FRACTION_METRIC,
     TIS_LCS_FALLBACK_ALERT_METRIC,
@@ -48,6 +49,11 @@ class TrajectoryRunner(ABC):
             TrajectoryBatch: Generated trajectories
         """
         output = await self._run(input_batch, disable_tqdm=disable_tqdm)
+        trajectory_ids = input_batch.get("trajectory_ids")
+        if trajectory_ids is not None and output.get("trajectory_ids") is None:
+            if len(trajectory_ids) != len(output["response_ids"]):
+                raise ValueError("trajectory runner output rows must align with request trajectory IDs")
+            output["trajectory_ids"] = list(trajectory_ids)
         return await self._finalize_output(input_batch, output)
 
     async def _finalize_output(self, input_batch: TrajectoryRequestBatch, output: TrajectoryBatch) -> TrajectoryBatch:
@@ -111,6 +117,7 @@ class TrajectoryRunner(ABC):
                 TIS_ALIGNMENT_FAIL_COUNT_METRIC: 0.0,
                 TIS_LCS_FALLBACK_MESSAGES_METRIC: 0.0,
                 TIS_LCS_FALLBACK_ALERT_METRIC: 0.0,
+                TIS_ALIGNMENT_ALERT_METRIC: 0.0,
             }
         )
         output["rollout_metrics"] = rollout_metrics

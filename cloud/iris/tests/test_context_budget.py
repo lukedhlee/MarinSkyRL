@@ -38,6 +38,8 @@ _CONFIGS = {
     "delphi_math_rl.yaml": (4096, 3584, 1),
     "delphi_math_rl_ifeval.yaml": (4096, 3584, 1),
     "opencode_smoke_literal.yaml": (32768, 4096, 30),
+    "snowball_megatron_full.yaml": (9216, 8192, 1),
+    "snowball_megatron_smoke.yaml": (2048, 512, 1),
     "tasktrove_dq_sweep_30b.yaml": (131072, 16384, 90),
     "tasktrove_dq_sweep_30b_cp6.yaml": (131072, 16384, 90),
     "tasktrove_dq_sweep_30b_gb200.yaml": (131072, 16384, 90),
@@ -50,6 +52,8 @@ _FLASH_ATTN_CONFIGS = {
     "32GPU_qwen3_coder_30b_a3b_ep4.yaml",
     "32GPU_qwen3_coder_30b_a3b_ep4_nooffload.yaml",
     "64GPU_qwen3_6_35b_a3b.yaml",
+    "snowball_megatron_full.yaml",
+    "snowball_megatron_smoke.yaml",
     "tasktrove_dq_sweep_30b.yaml",
     "tasktrove_dq_sweep_30b_cp6.yaml",
     "tasktrove_dq_sweep_30b_gb200.yaml",
@@ -75,6 +79,7 @@ def test_all_iris_configs_materialize_one_coherent_context_budget():
         assert parsed.generator["max_turns"] == turns
         if parsed.terminal_bench is not None:
             assert parsed.terminal_bench["harbor"]["max_turns"] == turns
+            assert parsed.terminal_bench["harbor"]["llm_call_kwargs"]["max_tokens"] == output
             assert parsed.terminal_bench["model_info"] == {
                 "max_input_tokens": parsed.context_budget.max_input_tokens,
                 "max_output_tokens": output,
@@ -102,6 +107,7 @@ def test_context_budget_derives_all_hydra_length_arguments():
     assert "++terminal_bench_config.model_info.max_input_tokens=114688" in args
     assert "++terminal_bench_config.model_info.max_output_tokens=16384" in args
     assert "++terminal_bench_config.harbor.max_turns=90" in args
+    assert "++terminal_bench_config.harbor.llm_call_kwargs.max_tokens=16384" in args
     assert "generator.trajectory_reward_shaping.overlong.l_max=65536" in args
     assert "generator.trajectory_reward_shaping.overlong.l_cache=16384" in args
 

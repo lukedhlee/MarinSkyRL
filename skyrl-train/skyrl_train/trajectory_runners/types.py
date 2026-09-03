@@ -7,7 +7,7 @@ from skyrl_train.inference_engines.base import ConversationType
 
 
 TrainingPhase = Literal["train", "eval"]
-REWARD_SHAPING_COMPONENT_NAMES = ("non_termination", "overlong", "successful_length")
+REWARD_SHAPING_COMPONENT_NAMES = ("passthrough", "non_termination", "overlong", "successful_length")
 
 
 class TokenProvenance(StrEnum):
@@ -29,6 +29,7 @@ class AgentLoopOutput:
     env_metrics: Dict[str, Any]
     captured_global_step: Optional[int] = None
     token_provenance: TokenProvenance = TokenProvenance.ENGINE
+    error_treatment: Optional[str] = None
 
 
 @dataclass
@@ -56,6 +57,7 @@ class TrajectoryRequestBatch(TypedDict):
 
 
 class RewardShapingComponents(TypedDict):
+    passthrough: float
     non_termination: float
     overlong: float
     successful_length: float
@@ -64,6 +66,20 @@ class RewardShapingComponents(TypedDict):
 class RewardShapingLoopSpan(TypedDict):
     start: int
     end: int
+
+
+class VerifierTestRecord(TypedDict):
+    record_id: str
+    trial_id: TrajectoryID
+    test_id: str
+    outcome: str
+    output: str
+
+
+class VerifierTestCollection(TypedDict):
+    parser: Optional[str]
+    complete: bool
+    tests: List[VerifierTestRecord]
 
 
 class TrajectoryBatch(TypedDict):
@@ -81,8 +97,11 @@ class TrajectoryBatch(TypedDict):
     reward_shaping_loop_spans: Optional[List[List[RewardShapingLoopSpan]]]
     loop_advantages: Optional[List[List[float]]]
     reward_shaping_versions: Optional[List[int]]
+    verifier_tests: Optional[List[Optional[VerifierTestCollection]]]
     loss_masks: List[List[int]]
     stop_reasons: Optional[List[str]]
+    exception_types: Optional[List[Optional[str]]]
+    error_treatments: Optional[List[Optional[str]]]
     rollout_metrics: Optional[Dict[str, Any]]
     rollout_logprobs: Optional[List[List[float]]]
     rollout_routed_experts: Optional[List[List[List[List[int]]]]]

@@ -604,7 +604,9 @@ def validate_cfg(cfg: DictConfig):
         "trainer.progress.percent_step": cfg.trainer.progress.percent_step,
         "trainer.progress.count_step": cfg.trainer.progress.count_step,
         "generator.r3_dispatch_put_timeout_seconds": cfg.generator.r3_dispatch_put_timeout_seconds,
-        "generator.coordinator_executor_workers": cfg.generator.coordinator_executor_workers,
+        "trajectory_runner.process_pool.num_coordinators": cfg.trajectory_runner.process_pool.num_coordinators,
+        "trajectory_runner.process_pool.cpus_per_coordinator": cfg.trajectory_runner.process_pool.cpus_per_coordinator,
+        "trajectory_runner.process_pool.executor_workers": cfg.trajectory_runner.process_pool.executor_workers,
         "trainer.policy.fsdp_config.expert_loader_chunk_rows": cfg.trainer.policy.fsdp_config.expert_loader_chunk_rows,
     }
     for path, value in runtime_values.items():
@@ -613,6 +615,11 @@ def validate_cfg(cfg: DictConfig):
     if cfg.trainer.model_load_retry.max_retries < 0:
         raise ValueError(
             f"trainer.model_load_retry.max_retries must be non-negative; got {cfg.trainer.model_load_retry.max_retries}"
+        )
+    if cfg.trainer.algorithm.group_admission.max_sample_batches < 0:
+        raise ValueError(
+            "trainer.algorithm.group_admission.max_sample_batches must be non-negative; got "
+            f"{cfg.trainer.algorithm.group_admission.max_sample_batches}"
         )
     if cfg.trainer.algorithm.tis_lcs_alert_threshold < 0:
         raise ValueError(
@@ -785,6 +792,23 @@ def validate_cfg(cfg: DictConfig):
             logger.warning(
                 "`trainer.exclude_modules` is deprecated, use `trainer.policy.model.lora.exclude_modules` or `trainer.critic.model.lora.exclude_modules` instead"
             )
+
+    if (
+        cfg.trainer.strategy == "megatron"
+        and cfg.trainer.micro_forward_batch_size_per_gpu != cfg.trainer.micro_train_batch_size_per_gpu
+    ):
+        raise ValueError(
+            "Megatron recomputes old log-probs with micro_forward_batch_size_per_gpu="
+            f"{cfg.trainer.micro_forward_batch_size_per_gpu} but trains with micro_train_batch_size_per_gpu="
+            f"{cfg.trainer.micro_train_batch_size_per_gpu}; cuBLAS selects kernels per shape, so the two "
+            "passes disagree and PPO clipping acts on kernel noise. Use equal sizes."
+        )
+
+    if cfg.trainer.offload_optimizer_during_rollouts and cfg.trainer.placement.colocate_all:
+        raise ValueError(
+            "trainer.offload_optimizer_during_rollouts applies to disaggregated runs only; "
+            "colocated runs already offload the optimizer between policy updates"
+        )
 
     # Validate placement
     if cfg.trainer.placement.colocate_all:

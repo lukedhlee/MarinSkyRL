@@ -19,13 +19,15 @@ from skyrl_train.fully_async_trainer import (
 from skyrl_train.async_rollout_state import GeneratedOutputGroup
 from skyrl_train.dynamic_sampling import GroupSelectionPolicy
 from skyrl_train.group_admission import GroupAdmissionPolicy, GroupAdvantageInvariant
+from skyrl_train.utils.data_tracker import DataConsumptionTracker
 
 
-def _make_queues() -> _GenerationQueues:
+def _make_queues(*, active_producers=0) -> _GenerationQueues:
     return _GenerationQueues(
         completed=asyncio.Queue(),
         retries=asyncio.Queue(),
         condition=asyncio.Condition(),
+        active_producers=active_producers,
     )
 
 
@@ -54,6 +56,7 @@ def _bare_trainer(
         max_staleness_steps=0,
         rollout_logprobs_required=False,
     )
+    trainer.data_tracker = DataConsumptionTracker(mini_batch_size=mini_batch_size, num_steps_per_epoch=1)
     return trainer
 
 
@@ -77,34 +80,16 @@ def test_generation_stall_timeout(history, expected):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("history", [[], [100.0, 200.0, 300.0], [10_000.0, 20_000.0, 30_000.0]])
-async def test_admission_stall_timeout_is_independent_of_step_duration(history):
+async def test_admission_stall_timeout_stops_live_but_unproductive_generators(history):
     alive_task = asyncio.create_task(asyncio.Event().wait())
     trainer = _bare_trainer(step_times=history, tasks=[alive_task], admission_stall_timeout=21_600)
     try:
-        assert trainer._check_admission_stall(elapsed=1800.0, rejection_counts=collections.Counter()) == 21_600
-    finally:
-        alive_task.cancel()
-
-
-# --------------------------------------------------------------------------- #
-# _any_generators_alive and _check_generation_stall                           #
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_check_stall_raises_when_no_generators():
-    trainer = _bare_trainer(tasks=[])
-    with pytest.raises(GenerationStalledError, match="no active generators"):
-        trainer._check_generation_stall(elapsed=600.0)
-
-
-@pytest.mark.asyncio
-async def test_check_stall_extends_when_generators_alive():
-    alive_task = asyncio.create_task(asyncio.Event().wait())
-    trainer = _bare_trainer(tasks=[alive_task])
-    try:
-        new_timeout = trainer._check_generation_stall(elapsed=600.0)
-        assert new_timeout == trainer._generation_stall_timeout()
+        with pytest.raises(GenerationStalledError, match="active_producers=1"):
+            trainer._raise_admission_stall(
+                elapsed=21_600.0,
+                rejection_counts=collections.Counter(),
+                active_producers=1,
+            )
     finally:
         alive_task.cancel()
 
@@ -118,13 +103,23 @@ async def test_check_stall_extends_when_generators_alive():
 async def test_get_admitted_batch_raises_when_generators_dead():
     """When all generators have exited and the buffer is short, raise immediately."""
     trainer = _bare_trainer(mini_batch_size=2, tasks=[])
-    # Patch the timeout to 0.05s so the test runs fast.
-    trainer.admission_stall_timeout = 0.05
-
     queues = _make_queues()
 
-    with pytest.raises(GenerationStalledError, match="no active generators"):
+    with pytest.raises(GenerationStalledError, match="admitted=0/2"):
         await trainer._get_admitted_generation_group_mini_batch(queues)
+
+
+@pytest.mark.asyncio
+async def test_get_admitted_batch_stops_when_last_producer_exhausts_dataset():
+    trainer = _bare_trainer(mini_batch_size=2, tasks=[])
+    trainer.admission_stall_timeout = 21_600
+    queues = _make_queues(active_producers=1)
+
+    admission = asyncio.create_task(trainer._get_admitted_generation_group_mini_batch(queues))
+    await queues.mark_producer_finished()
+
+    with pytest.raises(GenerationStalledError, match="admitted=0/2"):
+        await asyncio.wait_for(admission, timeout=1)
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ import pytest
 
 from skyrl_train.trajectory_runners.base import TrajectoryRequestBatch, TrajectoryRunner, TrajectoryBatch
 from skyrl_train.trajectory_runners.trajectory_processing import concatenate_trajectory_batches
+from skyrl_train.trajectory_runners.types import TrajectoryID
 
 
 class _AlignedRunner(TrajectoryRunner):
@@ -33,6 +34,7 @@ class _ReconstructedRunner(TrajectoryRunner):
                 "generate/tis/alignment_fail_count": 0.0,
                 "generate/tis/lcs_fallback_messages": 1.0,
                 "generate/tis/lcs_fallback_alert": 1.0,
+                "generate/tis/alignment_alert": 1.0,
             },
             "rollout_logprobs": [[-0.1, -0.2]],
         }
@@ -51,6 +53,7 @@ async def test_run_adds_alignment_health_for_position_aligned_logprobs():
         "generate/tis/alignment_fail_count": 0.0,
         "generate/tis/lcs_fallback_messages": 0.0,
         "generate/tis/lcs_fallback_alert": 0.0,
+        "generate/tis/alignment_alert": 0.0,
     }
 
     concatenated = concatenate_trajectory_batches([output], tis_lcs_alert_threshold=0.005)
@@ -68,8 +71,18 @@ async def test_run_preserves_measured_reconstruction_alignment_metrics():
         "generate/tis/alignment_fail_count": 0.0,
         "generate/tis/lcs_fallback_messages": 1.0,
         "generate/tis/lcs_fallback_alert": 1.0,
+        "generate/tis/alignment_alert": 1.0,
     }
     output = await _ReconstructedRunner().run({})
 
     for name, value in measured_metrics.items():
         assert output["rollout_metrics"][name] == value
+
+
+@pytest.mark.asyncio
+async def test_run_propagates_request_identity_when_runner_output_omits_it():
+    trajectory_ids = [TrajectoryID(instance_id="task", repetition_id=0)]
+
+    output = await _AlignedRunner().run({"trajectory_ids": trajectory_ids})
+
+    assert output["trajectory_ids"] == trajectory_ids

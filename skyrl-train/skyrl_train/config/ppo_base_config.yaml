@@ -9,6 +9,22 @@ defaults:
 data:
   train_data: ["${oc.env:HOME}/data/gsm8k/train.parquet"]
   val_data: ["${oc.env:HOME}/data/gsm8k/validation.parquet"]
+  sampling:
+    kind: null # null = stock shuffle; naive|thompson|learnability|grade-uniform|grade-adaptive|grade-prior
+    decay: 0.95 # per-step multiplicative decay of bin sufficient stats
+    epsilon: 0.05 # per-bin probability floor (thompson/learnability/grade-prior)
+    reversion_mass: 0.0 # per-step pseudo-evidence pulling every bin's belief toward the weight-curve peak
+    instance_decay: 0.7 # per-visit decay of per-row evidence (rows are visited too rarely for per-step decay)
+    prior_alpha: 1.0 # Beta prior for thompson (informative rate) and learnability (pass rate)
+    prior_beta: 1.0
+    grade_prior_strength: 8.0 # total prior pseudo-count per bin (grade-prior)
+    grade_prior_high: 0.85 # prior mean pass rate at the lowest grade (grade-prior)
+    grade_prior_low: 0.05 # prior mean pass rate at the highest grade (grade-prior)
+    adaptive_exploration: 0.2 # grade-adaptive: probability mass spread off the current level
+    adaptive_window: 10 # steps without informative signal before advancing the level
+    adaptive_min_informative: 0.1 # informative-group fraction below which the level is exhausted
+    weighting: pass-variance # learnability/grade-prior weight curve: pass-variance|group-informative
+    seed: null # falls back to trainer.seed
 
 checkpoint_export:
   step: null
@@ -214,6 +230,10 @@ trainer:
       min_replace_ratio: 0.3
       informative_on: shaped
       min_reward_std: 0.0
+
+    group_admission:
+      # Bound replacement generation when completed groups cannot enter training.
+      max_sample_batches: 30
     
     clip_cov:
       clip_ratio: 0.0002
@@ -273,6 +293,11 @@ trainer:
   micro_forward_batch_size_per_gpu: 1
   update_ref_every_epoch: false
   use_sample_packing: true
+  # Disaggregated only: keep the policy's optimizer state and gradient buffers on
+  # CPU from the end of each policy update until the next one, covering the
+  # weight export, rollouts, and the log-probability forwards. Frees that memory
+  # for the export's gathered expert tensors and for a colocated reference model.
+  offload_optimizer_during_rollouts: false
   eval_batch_size: 1024
   eval_before_train: true
   eval_interval: 5
@@ -316,7 +341,6 @@ generator:
   fuse_weights: false
   r3_transport: "decentral"
   r3_dispatch_put_timeout_seconds: 600
-  coordinator_executor_workers: 256
   gdn_backend: "torch"
   weight_transfer_threshold_cuda_ipc_GB: 1.0
   inference_engine_tensor_parallel_size: 4
@@ -335,7 +359,7 @@ generator:
   max_num_batched_tokens: 8192
   enforce_eager: true
   fully_sharded_loras: false
-  vllm_stats_interval: 1
+  inference_stats_interval: 1
   gpu_memory_utilization: 0.8
   max_num_seqs: 1024
   remote_inference_engine_urls: ["127.0.0.1:8001"]
@@ -389,6 +413,9 @@ generator:
       minimum_occurrences: 4
       advantage_penalty_per_token: 0.0
       max_advantage_penalty: 0.2
+    passthrough:
+      # Subtract from optimization reward when the Harbor taxonomy classifies the terminal exception as PASSTHROUGH.
+      penalty: 0.0
     non_termination:
       penalty: 0.0
       accepted_stop_reasons: [stop, complete, eos, end_turn]
@@ -446,9 +473,9 @@ teacher:
 environment:
   env_class: "gsm8k"
 
-rollout:
-  fanout:
-    enabled: true
+trajectory_runner:
+  process_pool:
     num_coordinators: 4
     cpus_per_coordinator: 8
-    coordinator_rpc_timeout: 21600
+    executor_workers: 256
+    rpc_timeout_seconds: 21600

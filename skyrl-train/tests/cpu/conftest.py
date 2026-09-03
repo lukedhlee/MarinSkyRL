@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 import pytest
+from omegaconf import OmegaConf
 
 # CPU tests already run in the locked uv environment. Ray's uv hook would package
 # this checkout and create another environment for every local Ray session.
@@ -11,6 +12,47 @@ os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
 
 import ray  # noqa: E402
 import torch.distributed as dist  # noqa: E402
+from skyrl_train.trajectory_runners.harbor.execution import HarborRunnerSpec  # noqa: E402
+from skyrl_train.trajectory_runners.types import TrajectoryID, VerifierTestCollection  # noqa: E402
+
+
+@pytest.fixture
+def harbor_runner_spec() -> HarborRunnerSpec:
+    """Return the minimum common Harbor runner specification used by dispatcher tests."""
+    config = OmegaConf.create(
+        {
+            "trainer": {
+                "algorithm": {
+                    "policy_loss_type": "regular",
+                    "use_tis": False,
+                    "behavior_clip": None,
+                    "tis_lcs_alert_threshold": 0.1,
+                }
+            }
+        }
+    )
+    return HarborRunnerSpec(config, OmegaConf.create({}), OmegaConf.create({}))
+
+
+@pytest.fixture
+def verifier_test_collection_factory():
+    def build(trial: int, outcomes: dict[str, str], *, complete: bool = True) -> VerifierTestCollection:
+        return {
+            "parser": "test",
+            "complete": complete,
+            "tests": [
+                {
+                    "record_id": f"trial-{trial}:{test_id}",
+                    "trial_id": TrajectoryID(instance_id="task", repetition_id=trial),
+                    "test_id": test_id,
+                    "outcome": outcome,
+                    "output": f"{test_id}: {outcome}",
+                }
+                for test_id, outcome in outcomes.items()
+            ],
+        }
+
+    return build
 
 
 def _kill_registry_actors() -> None:

@@ -31,18 +31,38 @@ Usage:
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
+from hashlib import sha256
+import json
 import math
 import re
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 from loguru import logger
+from skyrl_train.trajectory_runners.types import TrajectoryID, VerifierTestCollection, VerifierTestRecord
 
 
 # =============================================================================
 # Data Classes
 # =============================================================================
+
+
+class VerifierTestOutcome(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    ERROR = "error"
+    XFAILED = "xfailed"
+    XPASSED = "xpassed"
+    SKIPPED = "skipped"
+
+
+@dataclass(frozen=True)
+class ParsedVerifierTest:
+    test_id: str
+    outcome: VerifierTestOutcome
+    output: str
 
 
 @dataclass
@@ -62,6 +82,8 @@ class ParsedTestResult:
         duration_sec: Test duration in seconds (if available)
         raw_output: Original output string for debugging
         metadata: Additional framework-specific data
+        tests: Individually identified test outcomes and their literal output lines
+        tests_complete: Whether tests account for every aggregate outcome with unique identities
     """
 
     passed: int = 0
@@ -74,7 +96,9 @@ class ParsedTestResult:
     total: int = 0
     duration_sec: Optional[float] = None
     raw_output: str = ""
-    metadata: Dict[str, any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    tests: tuple[ParsedVerifierTest, ...] = ()
+    tests_complete: bool = False
 
     def __post_init__(self):
         # Compute total if not explicitly set
@@ -109,6 +133,109 @@ class ParsedTestResult:
         if self.runnable_total == 0:
             return 0.0
         return self.effective_passed / self.runnable_total
+
+
+_OUTCOME_BY_LABEL = {
+    "PASS": VerifierTestOutcome.PASSED,
+    "PASSED": VerifierTestOutcome.PASSED,
+    "FAIL": VerifierTestOutcome.FAILED,
+    "FAILED": VerifierTestOutcome.FAILED,
+    "ERROR": VerifierTestOutcome.ERROR,
+    "XFAIL": VerifierTestOutcome.XFAILED,
+    "XFAILED": VerifierTestOutcome.XFAILED,
+    "XPASS": VerifierTestOutcome.XPASSED,
+    "XPASSED": VerifierTestOutcome.XPASSED,
+    "SKIP": VerifierTestOutcome.SKIPPED,
+    "SKIPPED": VerifierTestOutcome.SKIPPED,
+}
+
+_PYTEST_TEST_LINE = re.compile(r"^(?P<outcome>PASSED|FAILED|ERROR|XFAIL|XPASS|SKIPPED)\s+(?P<test_id>\S+)(?:\s+.*)?$")
+_PYTEST_STANDARD_TEST_LINE = re.compile(
+    r"^(?P<test_id>\S+)\s+(?P<outcome>PASSED|FAILED|ERROR|XFAIL|XPASS|SKIPPED)(?:\s+.*)?$"
+)
+_BRACKET_TEST_LINE = re.compile(
+    r"^\[(?P<test_id>[^\]]+)\]\s+(?P<outcome>PASS|PASSED|FAIL|FAILED|ERROR|SKIP|SKIPPED|XFAIL|XPASS)(?::.*)?$"
+)
+_SUFFIX_TEST_LINE = re.compile(
+    r"^(?P<test_id>.+?):\s*(?P<outcome>PASS|PASSED|FAIL|FAILED|ERROR|SKIP|SKIPPED|XFAIL|XPASS)(?::.*)?$"
+)
+_PREFIX_TEST_LINE = re.compile(
+    r"^(?P<outcome>PASS|PASSED|FAIL|FAILED|ERROR|SKIP|SKIPPED|XFAIL|XPASS)\s+(?P<test_id>\S+)(?:\s+.*)?$"
+)
+
+
+def _identified_tests(output: str, parser_name: str) -> tuple[ParsedVerifierTest, ...]:
+    patterns = (
+        (_PYTEST_TEST_LINE, _PYTEST_STANDARD_TEST_LINE)
+        if parser_name == PytestOutputParser.name()
+        else (_BRACKET_TEST_LINE, _SUFFIX_TEST_LINE, _PREFIX_TEST_LINE)
+    )
+    tests = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        for pattern in patterns:
+            match = pattern.fullmatch(line)
+            if match is None:
+                continue
+            tests.append(
+                ParsedVerifierTest(
+                    test_id=match.group("test_id").strip(),
+                    outcome=_OUTCOME_BY_LABEL[match.group("outcome")],
+                    output=raw_line,
+                )
+            )
+            break
+    return tuple(tests)
+
+
+def _tests_are_complete(parsed: ParsedTestResult) -> bool:
+    if len(parsed.tests) != parsed.total:
+        return False
+    if len({test.test_id for test in parsed.tests}) != len(parsed.tests):
+        return False
+    expected = {
+        VerifierTestOutcome.PASSED: parsed.passed,
+        VerifierTestOutcome.FAILED: parsed.failed,
+        VerifierTestOutcome.ERROR: parsed.errors,
+        VerifierTestOutcome.XFAILED: parsed.xfailed,
+        VerifierTestOutcome.XPASSED: parsed.xpassed,
+        VerifierTestOutcome.SKIPPED: parsed.skipped,
+    }
+    return all(sum(test.outcome is outcome for test in parsed.tests) == count for outcome, count in expected.items())
+
+
+def _with_identified_tests(parsed: ParsedTestResult, tests: tuple[ParsedVerifierTest, ...]) -> ParsedTestResult:
+    parsed_with_tests = replace(parsed, tests=tests)
+    return replace(parsed_with_tests, tests_complete=_tests_are_complete(parsed_with_tests))
+
+
+def verifier_test_collection(
+    parsed: ParsedTestResult | None,
+    *,
+    parser_name: str | None,
+    instance_id: str,
+    repetition_id: int,
+) -> VerifierTestCollection:
+    """Materialize parsed tests with deterministic trial-scoped record IDs."""
+    records: list[VerifierTestRecord] = []
+    for occurrence, test in enumerate(() if parsed is None else parsed.tests):
+        identity = json.dumps(
+            [instance_id, repetition_id, test.test_id, occurrence], ensure_ascii=False, separators=(",", ":")
+        )
+        records.append(
+            {
+                "record_id": sha256(identity.encode()).hexdigest(),
+                "trial_id": TrajectoryID(instance_id=instance_id, repetition_id=repetition_id),
+                "test_id": test.test_id,
+                "outcome": test.outcome.value,
+                "output": test.output,
+            }
+        )
+    return {
+        "parser": parser_name,
+        "complete": parsed is not None and parsed.tests_complete,
+        "tests": records,
+    }
 
 
 # =============================================================================
@@ -181,16 +308,6 @@ class PytestOutputParser(OutputParser):
 
     # Pattern to extract individual counts from summary
     COUNT_PATTERN = re.compile(r"(\d+)\s+(\w+)", re.IGNORECASE)
-
-    # Patterns for individual test result lines
-    RESULT_LINE_PATTERNS = {
-        "passed": re.compile(r"^PASSED\s+", re.MULTILINE),
-        "failed": re.compile(r"^FAILED\s+", re.MULTILINE),
-        "error": re.compile(r"^ERROR\s+", re.MULTILINE),
-        "xfail": re.compile(r"^XFAIL\s+", re.MULTILINE),
-        "xpass": re.compile(r"^XPASS\s+", re.MULTILINE),
-        "skipped": re.compile(r"^SKIPPED\s+", re.MULTILINE),
-    }
 
     # Patterns that indicate pytest couldn't collect/load tests
     # These are infrastructure failures, not agent failures
@@ -289,25 +406,17 @@ class PytestOutputParser(OutputParser):
 
     def _parse_from_lines(self, output: str) -> Optional[ParsedTestResult]:
         """Parse by counting individual test result lines."""
-        counts = {}
-        found_any = False
-
-        for status, pattern in self.RESULT_LINE_PATTERNS.items():
-            matches = pattern.findall(output)
-            counts[status] = len(matches)
-            if counts[status] > 0:
-                found_any = True
-
-        if not found_any:
+        tests = _identified_tests(output, self.name())
+        if not tests:
             return None
 
         return ParsedTestResult(
-            passed=counts.get("passed", 0),
-            failed=counts.get("failed", 0),
-            errors=counts.get("error", 0),
-            xfailed=counts.get("xfail", 0),
-            xpassed=counts.get("xpass", 0),
-            skipped=counts.get("skipped", 0),
+            passed=sum(test.outcome is VerifierTestOutcome.PASSED for test in tests),
+            failed=sum(test.outcome is VerifierTestOutcome.FAILED for test in tests),
+            errors=sum(test.outcome is VerifierTestOutcome.ERROR for test in tests),
+            xfailed=sum(test.outcome is VerifierTestOutcome.XFAILED for test in tests),
+            xpassed=sum(test.outcome is VerifierTestOutcome.XPASSED for test in tests),
+            skipped=sum(test.outcome is VerifierTestOutcome.SKIPPED for test in tests),
             raw_output=output,
             metadata={"parse_method": "line_count"},
         )
@@ -537,12 +646,13 @@ class GenericOutputParser(OutputParser):
 
 
 class PassRatioSummaryOutputParser(OutputParser):
-    """Parse verifier summaries such as ``Results: 13/20 passed (ratio=0.65)``."""
+    """Parse pass-ratio summaries and explicit no-solution failures."""
 
     SUMMARY_PATTERN = re.compile(
         r"^Results:\s*(\d+)\s*/\s*(\d+)\s+passed(?:\s*\(ratio\s*=\s*[\d.]+\))?\s*$",
         re.IGNORECASE | re.MULTILINE,
     )
+    NO_SOLUTION_PATTERN = re.compile(r"^No solution found at .+$", re.IGNORECASE | re.MULTILINE)
 
     @classmethod
     def name(cls) -> str:
@@ -551,7 +661,14 @@ class PassRatioSummaryOutputParser(OutputParser):
     def parse(self, output: str) -> Optional[ParsedTestResult]:
         match = self.SUMMARY_PATTERN.search(output)
         if match is None:
-            return None
+            if self.NO_SOLUTION_PATTERN.search(output) is None:
+                return None
+            return ParsedTestResult(
+                passed=0,
+                failed=1,
+                raw_output=output,
+                metadata={"parse_method": "no_solution"},
+            )
         passed = int(match.group(1))
         total = int(match.group(2))
         if passed > total:
@@ -1962,14 +2079,25 @@ def parse_test_output(
     Returns:
         ParsedTestResult or None if parsing failed
     """
+    parsed, _ = parse_test_output_with_parser(output, parser_name)
+    return parsed
+
+
+def parse_test_output_with_parser(
+    output: str,
+    parser_name: Optional[str] = None,
+) -> tuple[Optional[ParsedTestResult], Optional[str]]:
+    """Parse test output and report which parser handled it."""
     if parser_name:
         parser = get_output_parser(parser_name)
     else:
         parser = auto_detect_parser(output)
         if parser is None:
-            return None
-
-    return parser.parse(output)
+            return None, None
+    parsed = parser.parse(output)
+    if parsed is not None:
+        parsed = _with_identified_tests(parsed, _identified_tests(output, parser.name()))
+    return parsed, parser.name()
 
 
 def shape_reward_from_output(

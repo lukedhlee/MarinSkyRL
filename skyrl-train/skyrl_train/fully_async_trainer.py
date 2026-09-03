@@ -27,7 +27,9 @@ from skyrl_train.utils.logging_utils import log_exception_as_text
 from skyrl_train.trajectory_runners.trajectory_processing import (
     prepare_trajectory_request,
     concatenate_trajectory_batches,
+    get_outcome_rewards,
 )
+from skyrl_train.trajectory_runners.trajectory_reward_shaping import NormalizedReward
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
 from dataclasses import dataclass, field
 from skyrl_train.utils.data_tracker import DataConsumptionTracker
@@ -79,8 +81,17 @@ class _GenerationQueues:
     completed: asyncio.Queue[GeneratedOutputGroup]
     retries: asyncio.Queue[List[dict]]
     condition: asyncio.Condition
+    active_producers: int = 0
     admitted_groups: List[GeneratedOutputGroup] = field(default_factory=list)
     admitted_groups_consumed: bool = False
+
+    async def mark_producer_finished(self) -> None:
+        """Wake admission when a generation worker permanently exits."""
+        async with self.condition:
+            if self.active_producers <= 0:
+                raise RuntimeError("generation producer accounting underflow")
+            self.active_producers -= 1
+            self.condition.notify_all()
 
     def record_admitted(self, groups: List[GeneratedOutputGroup]) -> None:
         """Retain newly admitted groups until the step crosses its checkpoint boundary."""
@@ -157,11 +168,53 @@ class _AdmissionPartition:
 
 
 @dataclass
+class _DynamicSamplingCandidateMetrics:
+    group_count: int = 0
+    trajectory_count: int = 0
+    optimization_reward_sum: float = 0.0
+    outcome_reward_sum: float = 0.0
+    passed_group_count: int = 0
+    samples_per_group: int | None = None
+
+    def observe(self, batch: TrajectoryBatch) -> None:
+        rewards = batch["rewards"]
+        outcomes = get_outcome_rewards(batch)
+        group_size = len(outcomes)
+        if self.samples_per_group is None:
+            self.samples_per_group = group_size
+        elif self.samples_per_group != group_size:
+            raise ValueError(
+                "dynamic sampling candidates must have a consistent physical group size: "
+                f"got {self.samples_per_group} and {group_size}"
+            )
+        self.group_count += 1
+        self.trajectory_count += group_size
+        self.optimization_reward_sum += sum(NormalizedReward.from_output(reward).total for reward in rewards)
+        self.outcome_reward_sum += sum(outcomes)
+        self.passed_group_count += int(any(reward > 0.0 for reward in outcomes))
+
+    def merge(self, other: "_DynamicSamplingCandidateMetrics") -> None:
+        if other.samples_per_group is not None:
+            if self.samples_per_group is None:
+                self.samples_per_group = other.samples_per_group
+            elif self.samples_per_group != other.samples_per_group:
+                raise ValueError(
+                    "dynamic sampling candidates changed physical group size within a training step: "
+                    f"got {self.samples_per_group} and {other.samples_per_group}"
+                )
+        self.group_count += other.group_count
+        self.trajectory_count += other.trajectory_count
+        self.optimization_reward_sum += other.optimization_reward_sum
+        self.outcome_reward_sum += other.outcome_reward_sum
+        self.passed_group_count += other.passed_group_count
+
+
+@dataclass
 class _CandidateSelection:
     admitted_groups: List[GeneratedOutputGroup]
     surplus_groups: List[GeneratedOutputGroup]
     discarded_reasons: collections.Counter[str]
-    candidate_count: int
+    candidate_metrics: _DynamicSamplingCandidateMetrics
 
 
 class _AsyncStalenessManager:
@@ -284,24 +337,35 @@ class _AsyncDataloader:
     A train dataloader wrapper that accommodates the need of fully async training, including:
     - Thread-safe dataloader iteration with a lock, as there are multiple parallel generation workers polling data.
     - Skip-on-resume: uses DataConsumptionTracker's epoch-scoped UIDs to skip already-consumed data.
-    - Set the effective dataloader length to be divisible by mini-batch size, since we cannot rely on `drop_last`
-      because the batch size is 1 in fully async training.
+    - Finite iteration for ordinary async training and replacement passes for DAPO filter sampling.
+    - For finite iteration, set the effective length to a multiple of the mini-batch size because the underlying
+      fully async dataloader has batch size 1 and cannot use `drop_last` for the training mini-batch.
 
     Data consumption tracking (UID recording, epoch transitions, checkpoint persistence)
     is handled by DataConsumptionTracker + DataTrackingCallback, not by this class.
     """
 
     def __init__(
-        self, train_dataloader: StatefulDataLoader, mini_batch_size: int, data_tracker: DataConsumptionTracker
+        self,
+        train_dataloader: StatefulDataLoader,
+        mini_batch_size: int,
+        data_tracker: DataConsumptionTracker,
+        dynamic_sampling_type: DynamicSamplingType | None = None,
     ):
         self._train_dataloader = train_dataloader
         self._train_dataloader_initial_state = train_dataloader.state_dict()
-        self._effective_dataloader_length = len(self._train_dataloader) // mini_batch_size * mini_batch_size
+        self._sample_with_replacement = dynamic_sampling_type is DynamicSamplingType.FILTER
+        self._effective_dataloader_length = (
+            len(self._train_dataloader)
+            if self._sample_with_replacement
+            else len(self._train_dataloader) // mini_batch_size * mini_batch_size
+        )
         self._iter = enumerate(self._train_dataloader)
         self._lock: asyncio.Lock = asyncio.Lock()
         self._data_tracker = data_tracker
         self._pending_uids: set[str] = set()
         self._exhausted: bool = False
+        self._eligible_rows_returned_in_pass = 0
 
     def reserve_pending_uids(self, uids: set[str]) -> None:
         """Exclude checkpointed pending work from restarted dataset iteration."""
@@ -321,6 +385,7 @@ class _AsyncDataloader:
         # the beginning of the dataset (not the exhausted iterator from __init__).
         self._iter = enumerate(self._train_dataloader)
         self._exhausted = False
+        self._eligible_rows_returned_in_pass = 0
 
     async def reset_at_epoch_end(self) -> None:
         """Reset dataloader iterator for the next epoch.
@@ -334,29 +399,38 @@ class _AsyncDataloader:
             self._iter = enumerate(self._train_dataloader)
             self._pending_uids.clear()
             self._exhausted = False
+            self._eligible_rows_returned_in_pass = 0
 
     async def get_next_non_consumed_data(self):
         """
         Return the next batch of training data.
 
-        If we loaded from a checkpoint, it will skip the already-consumed data. Returns None if the dataloader is exhausted.
+        If we loaded from a checkpoint, it skips already-consumed data. DAPO filter sampling starts a new source
+        pass after exhaustion so rejected prompts can be generated again. Returns None when finite sampling ends or
+        when a complete filter pass contains no eligible UID.
         """
         assert self._iter is not None and self._lock is not None, "Dataloader not initialized; call reset() first"
-        # Resume skips groups that already trained and groups restored as pending work.
-        skip_set = self._data_tracker.get_consumed_uids_in_epoch() | self._pending_uids
         async with self._lock:
-            try:
-                while True:
+            # Read consumed UIDs after acquiring the iterator lock. Replacement passes can overlap a training step.
+            skip_set = self._data_tracker.get_consumed_uids_in_epoch() | self._pending_uids
+            while True:
+                try:
                     # Keep polling until we get a non-consumed data or the dataloader is exhausted.
-                    iter_idx, rand_prompts = next(self._iter)
-                    if iter_idx >= self._effective_dataloader_length:
-                        raise StopIteration
-                    uid = rand_prompts[0]["uid"]
-                    if uid not in skip_set:
-                        return rand_prompts
-            except StopIteration:
-                self._exhausted = True
-                return None
+                    while True:
+                        iter_idx, rand_prompts = next(self._iter)
+                        if iter_idx >= self._effective_dataloader_length:
+                            raise StopIteration
+                        uid = rand_prompts[0]["uid"]
+                        if uid not in skip_set:
+                            self._eligible_rows_returned_in_pass += 1
+                            return rand_prompts
+                except StopIteration:
+                    if self._sample_with_replacement and self._eligible_rows_returned_in_pass:
+                        self._iter = enumerate(self._train_dataloader)
+                        self._eligible_rows_returned_in_pass = 0
+                        continue
+                    self._exhausted = True
+                    return None
 
 
 class FullyAsyncRayPPOTrainer(RayPPOTrainer):
@@ -432,11 +506,6 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 self.cfg.trainer.algorithm.policy_loss_type
             ),
         )
-        # K-actor rollout fan-out gate. Resolved in _maybe_enable_rollout_fanout()
-        # at train() start; initialized False so the flag is always defined
-        # (e.g. if train() is never reached, the weight-sync block stays a no-op).
-        self._rollout_fanout_enabled = False
-
         # Some async-specific validations
         assert self.cfg.trainer.train_batch_size == self.cfg.trainer.policy_mini_batch_size, (
             "train_batch_size must equal policy_mini_batch_size for fully async training"
@@ -453,7 +522,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             mini_batch_size=self.mini_batch_size,
             num_steps_per_epoch=self.num_steps_per_epoch,
         )
-        self.async_train_dataloader = _AsyncDataloader(self.train_dataloader, self.mini_batch_size, self.data_tracker)
+        self.async_train_dataloader = _AsyncDataloader(
+            self.train_dataloader,
+            self.mini_batch_size,
+            self.data_tracker,
+            self._dynamic_sampling_type,
+        )
         # Register the data tracking callback for checkpoint persistence and epoch transitions
         self.callback_handler.add_callback(DataTrackingCallback(self.data_tracker))
         # Register buffer checkpoint callback for saving/restoring generation buffer on resume
@@ -571,51 +645,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         finally:
             await super().shutdown()
 
-    def _maybe_enable_rollout_fanout(self) -> None:
-        """Enable configured multi-actor rollout collection without distributing staleness state."""
-        rollout_cfg = OmegaConf.select(self.cfg, "rollout.fanout")
-        self._rollout_fanout_enabled = bool(rollout_cfg is not None and getattr(rollout_cfg, "enabled", False))
-        if not self._rollout_fanout_enabled:
-            return
-
-        # Harbor is optional and absent from launcher-only CPU environments.
-        from skyrl_train.trajectory_runners.harbor.rollout_dispatcher import RolloutDispatcher  # noqa: PLC0415
-
-        terminal_bench_cfg = OmegaConf.select(self.cfg, "terminal_bench_config")
-        if terminal_bench_cfg is None:
-            raise ValueError(
-                "rollout.fanout.enabled=true requires cfg.terminal_bench_config "
-                "(the terminal_bench RL path). Disable fan-out for other generators."
-            )
-
-        num_coordinators = int(getattr(rollout_cfg, "num_coordinators", 4))
-        cpus_per_coordinator = int(getattr(rollout_cfg, "cpus_per_coordinator", 8))
-        coordinator_rpc_timeout = float(rollout_cfg.coordinator_rpc_timeout)
-        logger.info(
-            f"Rollout fan-out ENABLED: replacing single-process runner with "
-            f"RolloutDispatcher (K={num_coordinators}, cpus_per_coordinator="
-            f"{cpus_per_coordinator}, coordinator_rpc_timeout={coordinator_rpc_timeout:g}s)."
-        )
-        self.trajectory_runner = RolloutDispatcher(
-            cfg=self.cfg,
-            trajectory_runner_cfg=self.cfg.generator,
-            terminal_bench_cfg=terminal_bench_cfg,
-            num_coordinators=num_coordinators,
-            cpus_per_coordinator=cpus_per_coordinator,
-            coordinator_rpc_timeout=coordinator_rpc_timeout,
-        )
-        # The sink was attached in __init__, to the runner just replaced. Re-attach it here rather
-        # than at the call site: the swap is what detaches it.
-        self.trajectory_runner.set_trajectory_sink(self.trajectory_sink)
-
     async def train(self):
         """
         Main fully async training loop for PPO
         """
         self.global_step = 0
-
-        # Fan-out is opt-in. When enabled, a missing terminal_bench_config raises instead of falling back.
-        self._maybe_enable_rollout_fanout()
 
         try:
             await self._startup_trajectory_runner()
@@ -739,6 +773,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 completed=asyncio.Queue(maxsize=self.max_buffered_groups),
                 retries=asyncio.Queue(),
                 condition=asyncio.Condition(),
+                active_producers=self.num_parallel_generation_workers,
             )
 
             self._buffer_checkpoint_callback.bind_queues(generation_queues)
@@ -1145,6 +1180,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             if slot_acquired:
                 await self._staleness_manager.cancel_submission_slot()
             sys.exit(1)
+        finally:
+            await queues.mark_producer_finished()
 
     async def _next_generation_prompts(
         self,
@@ -1278,7 +1315,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             discarded_groups=discarded_groups,
         )
 
-    def _publish_admission_metrics(self, *, dynamic_candidate_count: int, dynamic_discarded_count: int) -> None:
+    def _publish_admission_metrics(
+        self,
+        *,
+        dynamic_candidate_metrics: _DynamicSamplingCandidateMetrics,
+        dynamic_discarded_count: int,
+    ) -> None:
         rejected = self._groups_rejected_since_step
         inspected = self._groups_inspected_since_step
         assert inspected > 0, "An admitted training batch requires at least one inspected completed group"
@@ -1291,14 +1333,26 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             "async/rejected_rate": rejected / inspected,
         }
         if self._dynamic_sampling_type is DynamicSamplingType.FILTER:
+            candidate_count = dynamic_candidate_metrics.group_count
+            trajectory_count = dynamic_candidate_metrics.trajectory_count
+            assert candidate_count > 0 and trajectory_count > 0
             metrics.update(
                 {
-                    "async/dynamic_sampling/candidate_count": dynamic_candidate_count,
+                    "async/dynamic_sampling/candidate_count": candidate_count,
                     "async/dynamic_sampling/discarded_count": dynamic_discarded_count,
-                    "async/dynamic_sampling/discarded_rate": (
-                        dynamic_discarded_count / dynamic_candidate_count if dynamic_candidate_count else 0.0
+                    "async/dynamic_sampling/discarded_rate": (dynamic_discarded_count / candidate_count),
+                    "async/dynamic_sampling/candidate_trajectory_count": trajectory_count,
+                    "async/dynamic_sampling/candidate_optimization_reward_mean": (
+                        dynamic_candidate_metrics.optimization_reward_sum / trajectory_count
+                    ),
+                    "async/dynamic_sampling/candidate_outcome_reward_mean": (
+                        dynamic_candidate_metrics.outcome_reward_sum / trajectory_count
                     ),
                 }
+            )
+            assert dynamic_candidate_metrics.samples_per_group is not None
+            metrics[f"async/dynamic_sampling/candidate_pass_at_{dynamic_candidate_metrics.samples_per_group}"] = (
+                dynamic_candidate_metrics.passed_group_count / candidate_count
             )
         metrics.update(
             {f"async/rejected_count/{reason.value}": reason_counts[reason.value] for reason in AdmissionRejection}
@@ -1312,7 +1366,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             )
         if dynamic_discarded_count:
             logger.info(
-                f"Dynamic sampling discarded {dynamic_discarded_count} of {dynamic_candidate_count} "
+                f"Dynamic sampling discarded {dynamic_discarded_count} of {candidate_count} "
                 f"candidate groups before step {self.global_step}."
             )
 
@@ -1330,31 +1384,19 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         median = sorted_times[len(sorted_times) // 2]
         return max(median * 5.0, 600.0)
 
-    def _any_trajectory_workers_alive(self) -> bool:
-        return any(not t.done() for t in self._active_trajectory_tasks)
-
-    def _check_generation_stall(self, elapsed: float) -> float:
-        """Raise ``GenerationStalledError`` if no producers remain, else extend the deadline.
-
-        Returns the new stall timeout for the next wait cycle.
-        """
-        if not self._any_trajectory_workers_alive():
-            raise GenerationStalledError(f"Generation stalled: waited {elapsed:.0f}s, no active generators")
-        logger.warning(
-            f"Generation stall watchdog: {elapsed:.0f}s since last progress, "
-            f"generators still alive — extending deadline"
+    def _raise_admission_stall(
+        self,
+        elapsed: float,
+        rejection_counts: collections.Counter[str],
+        *,
+        active_producers: int,
+    ) -> None:
+        """Bound a step that has admitted no new groups, even if producer tasks remain alive."""
+        raise GenerationStalledError(
+            f"Generation stalled: no groups admitted for {elapsed:.0f}s; "
+            f"active_producers={active_producers}, "
+            f"rejected_completions={dict(rejection_counts)}"
         )
-        return self._generation_stall_timeout()
-
-    def _check_admission_stall(self, elapsed: float, rejection_counts: collections.Counter[str]) -> float:
-        """Raise on rejected-only progress, or restart the admission deadline."""
-        if rejection_counts:
-            raise GenerationStalledError(
-                f"Generation stalled: no groups admitted for {elapsed:.0f}s; "
-                f"rejected completions={dict(rejection_counts)}"
-            )
-        self._check_generation_stall(elapsed)
-        return float(self.admission_stall_timeout)
 
     def _select_dynamic_sampling_candidates(
         self,
@@ -1364,7 +1406,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
     ) -> _CandidateSelection:
         admitted_groups = []
         discarded_reasons: collections.Counter[str] = collections.Counter()
-        candidate_count = 0
+        candidate_metrics = _DynamicSamplingCandidateMetrics()
 
         for candidate_index, group in enumerate(candidates):
             if len(admitted_groups) >= available_slots:
@@ -1372,11 +1414,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     admitted_groups=admitted_groups,
                     surplus_groups=candidates[candidate_index:],
                     discarded_reasons=discarded_reasons,
-                    candidate_count=candidate_count,
+                    candidate_metrics=candidate_metrics,
                 )
 
             selection_result = self._group_selection_policy.evaluate(group)
-            candidate_count += int(self._dynamic_sampling_type is DynamicSamplingType.FILTER)
+            if self._dynamic_sampling_type is DynamicSamplingType.FILTER:
+                candidate_metrics.observe(group.trajectory_batch)
             if selection_result is GroupSelectionResult.KEEP:
                 admitted_groups.append(group)
             else:
@@ -1386,7 +1429,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             admitted_groups=admitted_groups,
             surplus_groups=[],
             discarded_reasons=discarded_reasons,
-            candidate_count=candidate_count,
+            candidate_metrics=candidate_metrics,
         )
 
     async def _get_admitted_generation_group_mini_batch(self, queues: _GenerationQueues) -> List[GeneratedOutputGroup]:
@@ -1403,30 +1446,42 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         last_admitted_progress = loop.time()
         stall_timeout = float(self.admission_stall_timeout)
         rejection_counts_since_admission: collections.Counter[str] = collections.Counter()
-        dynamic_candidate_count = 0
+        dynamic_candidate_metrics = _DynamicSamplingCandidateMetrics()
         dynamic_discarded_count = 0
 
         while True:
             async with queues.condition:
                 while len(accepted_groups) < self.mini_batch_size and queues.completed.empty():
+                    if queues.active_producers == 0:
+                        raise GenerationStalledError(
+                            "Generation exhausted its dataset before assembling a complete training batch: "
+                            f"admitted={len(accepted_groups)}/{self.mini_batch_size}, "
+                            f"dynamic_candidates={dynamic_candidate_metrics.group_count}, "
+                            f"dynamic_discarded={dynamic_discarded_count}, "
+                            f"rejections={dict(rejection_counts_since_admission)}"
+                        )
                     elapsed = loop.time() - last_admitted_progress
                     remaining = stall_timeout - elapsed
                     if remaining <= 0:
-                        stall_timeout = self._check_admission_stall(elapsed, rejection_counts_since_admission)
-                        last_admitted_progress = loop.time()
-                        continue
+                        self._raise_admission_stall(
+                            elapsed,
+                            rejection_counts_since_admission,
+                            active_producers=queues.active_producers,
+                        )
                     try:
                         await asyncio.wait_for(queues.condition.wait(), timeout=remaining)
                     except asyncio.TimeoutError:
-                        stall_timeout = self._check_admission_stall(
-                            loop.time() - last_admitted_progress, rejection_counts_since_admission
+                        self._raise_admission_stall(
+                            loop.time() - last_admitted_progress,
+                            rejection_counts_since_admission,
+                            active_producers=queues.active_producers,
                         )
-                        last_admitted_progress = loop.time()
 
                 completed_groups = _drain_queue(queues.completed)
                 partition = self._partition_completed_groups(
                     completed_groups,
-                    occupied_uids={group.uid for group in accepted_groups},
+                    occupied_uids={group.uid for group in accepted_groups}
+                    | self.data_tracker.get_consumed_uids_in_epoch(),
                 )
                 for group, decision in partition.rejected_groups:
                     queues.retries.put_nowait(group.source_prompts)
@@ -1438,7 +1493,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     available_slots=self.mini_batch_size - len(accepted_groups),
                 )
                 queues.record_admitted(selection.admitted_groups)
-                dynamic_candidate_count += selection.candidate_count
+                dynamic_candidate_metrics.merge(selection.candidate_metrics)
                 dynamic_discarded_this_scan = sum(selection.discarded_reasons.values())
                 dynamic_discarded_count += dynamic_discarded_this_scan
                 rejection_counts_since_admission.update(selection.discarded_reasons)
@@ -1470,7 +1525,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             if (
                 batch is None
                 and self._dynamic_sampling_max_candidate_groups is not None
-                and dynamic_candidate_count >= self._dynamic_sampling_max_candidate_groups
+                and dynamic_candidate_metrics.group_count >= self._dynamic_sampling_max_candidate_groups
             ):
                 raise RuntimeError(
                     "Exiting training loop due to hitting dynamic sampling limit for filter strategy with "
@@ -1482,7 +1537,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 break
 
         self._publish_admission_metrics(
-            dynamic_candidate_count=dynamic_candidate_count,
+            dynamic_candidate_metrics=dynamic_candidate_metrics,
             dynamic_discarded_count=dynamic_discarded_count,
         )
         return batch

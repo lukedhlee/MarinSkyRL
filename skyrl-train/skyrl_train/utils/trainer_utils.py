@@ -17,9 +17,9 @@ from skyrl_train.dynamic_sampling import (
     DynamicSamplingType,
     group_is_informative_for_dynamic_sampling,
 )
+from skyrl_train.batch_sampling import accumulate_selected_groups
 from skyrl_train.trajectory_runners.trajectory_processing import (
     get_metrics_from_trajectory_batch,
-    concatenate_trajectory_batches,
 )
 from skyrl_train.trajectory_runners.base import TrajectoryBatch
 from skyrl_train.trajectory_runners.trajectory_reward_shaping import (
@@ -31,6 +31,7 @@ from pathlib import Path
 from skyrl_train.io import io
 from skyrl_train.checkpoint_listing import extract_step_from_path, list_checkpoint_dirs
 from marinskyrl.checkpoint_paths import GLOBAL_STEP_PREFIX
+from skyrl_train.curriculum import CurriculumConfig, CurriculumSampler
 from skyrl_train.dataset import PromptDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -425,21 +426,6 @@ def handle_replace_sampling(
         return DynamicSamplingResult(trajectory_batch, uids, True, None)
 
 
-def _rekey_collected_uid_collisions(uids: List[str], collected_uids: List[str], sample_batch_count: int) -> List[str]:
-    """Keep later draws of a dataset row distinct from groups collected in earlier sampling rounds."""
-    occupied_uids = set(collected_uids)
-    remapped_uids: dict[str, str] = {}
-    for uid in dict.fromkeys(uids):
-        candidate = uid
-        collision_index = 0
-        while candidate in occupied_uids:
-            collision_index += 1
-            candidate = f"{uid}:sample_batch_{sample_batch_count}:{collision_index}"
-        remapped_uids[uid] = candidate
-        occupied_uids.add(candidate)
-    return [remapped_uids[uid] for uid in uids]
-
-
 def handle_filter_sampling(
     trajectory_batch: TrajectoryBatch,
     uids: List[str],
@@ -475,64 +461,29 @@ def handle_filter_sampling(
             criteria=criteria,
         )
     ]
-    kept_uids_set = set(kept_uids)
-
-    # Filter trajectories based on kept UIDs
-    kept_traj_idxs = []
-    for idx, traj_uid in enumerate(uids):
-        if traj_uid in kept_uids_set:
-            kept_traj_idxs.append(idx)
-
-    filtered_output = filter_trajectory_batch(trajectory_batch, kept_traj_idxs)
-    filtered_uids = [uids[idx] for idx in kept_traj_idxs]
-
-    # Dataset UIDs repeat across epochs. Re-key only later draws that would merge with a collected training group.
-    collected_uids = collected_state.get("collected_uids")
-    if collected_uids is not None:
-        filtered_uids = _rekey_collected_uid_collisions(
-            filtered_uids, collected_uids, collected_state["sample_batch_count"]
-        )
-
-    if "collected_trajectory_batch" not in collected_state:
-        collected_state.update(
-            {
-                "collected_trajectory_batch": filtered_output,
-                "collected_uids": filtered_uids.copy(),
-                "num_prompts_in_batch": len(kept_uids),
-            }
-        )
-    else:
-        collected_state["collected_trajectory_batch"] = concatenate_trajectory_batches(
-            [collected_state["collected_trajectory_batch"], filtered_output],
-            tis_lcs_alert_threshold=float(sampling_config["tis_lcs_alert_threshold"]),
-        )
-        collected_state["collected_uids"].extend(filtered_uids)
-        collected_state["num_prompts_in_batch"] += len(kept_uids)
+    accumulated = accumulate_selected_groups(
+        trajectory_batch,
+        uids,
+        kept_uids,
+        target_group_count=target_batch_size,
+        sample_batch_count=collected_state["sample_batch_count"],
+        tis_lcs_alert_threshold=float(sampling_config.get("tis_lcs_alert_threshold", 0.005)),
+        require_rollout_logprobs=False,
+        state=collected_state,
+    )
 
     # Check if we have enough prompts
-    if collected_state["num_prompts_in_batch"] < target_batch_size:
+    if accumulated.keep_sampling:
         logger.info("============= Dynamic sampling filter =============")
         logger.info(f"Dynamic sampling: {collected_state['num_prompts_in_batch']} < {target_batch_size} prompts")
         logger.info(f"Resample batch {collected_state['sample_batch_count']}, continue sampling...")
         logger.info("==================================================")
         return DynamicSamplingResult(trajectory_batch, uids, True, collected_state)
-    else:
-        logger.info("============= Dynamic sampling filter =============")
-        logger.info(
-            f"Dynamic sampling: collected {collected_state['num_prompts_in_batch']} >= {target_batch_size} prompts"
-        )
-        logger.info("==================================================")
-        # Truncate to exact batch size if needed
-        n_samples_per_prompt = sampling_config.get("n_samples_per_prompt", 1)
-        max_trajectories = target_batch_size * n_samples_per_prompt
-        final_output = collected_state["collected_trajectory_batch"]
-        final_uids = collected_state["collected_uids"]
 
-        if len(final_uids) > max_trajectories:
-            final_output = filter_trajectory_batch(final_output, list(range(max_trajectories)))
-            final_uids = final_uids[:max_trajectories]
-
-        return DynamicSamplingResult(final_output, final_uids, False, None)
+    logger.info("============= Dynamic sampling filter =============")
+    logger.info(f"Dynamic sampling: collected {collected_state['num_prompts_in_batch']} >= {target_batch_size} prompts")
+    logger.info("==================================================")
+    return DynamicSamplingResult(accumulated.trajectory_batch, accumulated.uids, False, None)
 
 
 def get_bad_sample_replacements(good_uids: List[str], bad_uids: List[str]) -> List[str]:
@@ -547,35 +498,6 @@ def get_bad_sample_replacements(good_uids: List[str], bad_uids: List[str]) -> Li
         chosen_replacement_uids = np.array(list(good_uids))[indices]
 
     return chosen_replacement_uids
-
-
-def filter_trajectory_batch(output: TrajectoryBatch, kept_indices: List[int]) -> TrajectoryBatch:
-    """Filter TrajectoryBatch based on kept indices."""
-    filtered = {
-        "prompt_token_ids": [output["prompt_token_ids"][i] for i in kept_indices],
-        "response_ids": [output["response_ids"][i] for i in kept_indices],
-        "rewards": [output["rewards"][i] for i in kept_indices],
-        "unshaped_rewards": (
-            [output["unshaped_rewards"][i] for i in kept_indices]
-            if output.get("unshaped_rewards") is not None
-            else None
-        ),
-        "loss_masks": [output["loss_masks"][i] for i in kept_indices],
-        "stop_reasons": None,
-        "rollout_metrics": output.get("rollout_metrics"),
-        "rollout_logprobs": (
-            [output["rollout_logprobs"][i] for i in kept_indices] if output["rollout_logprobs"] else None
-        ),
-    }
-
-    if output.get("stop_reasons"):
-        filtered["stop_reasons"] = [output["stop_reasons"][i] for i in kept_indices]
-    for key in REWARD_SHAPING_ROW_KEYS:
-        if output.get(key) is not None:
-            filtered[key] = [deepcopy(output[key][i]) for i in kept_indices]
-    refresh_trajectory_reward_shaping_metrics(filtered)
-
-    return filtered
 
 
 def build_dataloader(
@@ -598,13 +520,30 @@ def build_dataloader(
     seeded_generator = torch.Generator()
     seeded_generator.manual_seed(cfg.trainer.seed)
 
+    sampler = None
+    if is_train and cfg.data.sampling.kind is not None:
+        if is_fully_async:
+            raise ValueError("data.sampling.kind is not supported with fully async training")
+        if cfg.trainer.step_wise_training:
+            raise ValueError("data.sampling.kind requires per-prompt uids; step_wise_training is not supported")
+        sampling_seed = cfg.data.sampling.seed if cfg.data.sampling.seed is not None else cfg.trainer.seed
+        sampler = CurriculumSampler(
+            dataset,
+            CurriculumConfig.from_dict_config(cfg.data.sampling, group_size=cfg.generator.n_samples_per_prompt),
+            sampling_seed,
+            batch_size=batch_size,
+        )
+
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=batch_size if not is_fully_async else 1,
-        shuffle=True if is_train else False,
+        shuffle=is_train and sampler is None,
+        sampler=sampler,
         collate_fn=dataset.collate_fn,
+        # Curriculum sampling stays single-process: worker prefetch would draw several
+        # batches of indices ahead of the per-step weight updates.
         # TODO(Charlie): debug why inference http endpoint is slow when num_workers is 8
-        num_workers=0 if cfg.generator.enable_http_endpoint else 8,
+        num_workers=0 if (sampler is not None or cfg.generator.enable_http_endpoint) else 8,
         drop_last=True if is_train else False,
         generator=seeded_generator,
     )
