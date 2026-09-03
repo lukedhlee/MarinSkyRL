@@ -30,8 +30,8 @@ from skyrl_train.trajectory_runners.base import (
 )
 import copy
 from skyrl_train.trajectory_runners.trajectory_processing import (
-    _outcome_rewards,
     get_metrics_from_trajectory_batch,
+    get_outcome_rewards,
     prepare_trajectory_request,
     validate_trajectory_batch,
 )
@@ -1485,7 +1485,7 @@ class RayPPOTrainer:
             if diag_group_metrics:
                 # Same success predicate as pass@n: unshaped outcome reward > 0, so reward
                 # shaping cannot move the learnability metrics.
-                successes = [r > 0.0 for r in _outcome_rewards(trajectory_batch_for_metrics)]
+                successes = [r > 0.0 for r in get_outcome_rewards(trajectory_batch_for_metrics)]
                 stop_reasons = trajectory_batch_for_metrics.get("stop_reasons")
                 self.all_metrics.update(
                     diag_utils.compute_group_diagnostics(
