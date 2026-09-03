@@ -10,6 +10,8 @@ env) we stub those submodules via the shared tests/cpu/util.py helper — only i
 megatron is genuinely absent, so a real-megatron env is left untouched.
 """
 
+import weakref
+
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -126,9 +128,30 @@ class _FakeHFModel:
         return self._action_log_probs, {"entropy": entropy}
 
 
+class _LogitsHFModel(_FakeHFModel):
+    """Like the real wrapper, also returns the full-vocab logits in the output dict."""
+
+    logits_ref = None
+
+    def __call__(self, sequences, num_actions, **kwargs):
+        action_log_probs, output = super().__call__(sequences, num_actions, **kwargs)
+        logits = torch.zeros(sequences.shape[0], sequences.shape[1], 8)
+        self.logits_ref = weakref.ref(logits)
+        return action_log_probs, {**output, "logits": logits}
+
+
 class _FakeStrategy:
     def backward(self, loss, model, optimizer):
         pass
+
+
+class _LogitsWatchingStrategy(_FakeStrategy):
+    """Records whether the model's logits were still alive when backward ran."""
+
+    logits_alive_at_backward = None
+
+    def backward(self, loss, model, optimizer):
+        self.logits_alive_at_backward = model.logits_ref() is not None
 
 
 class _FakeScheduler:
@@ -136,13 +159,19 @@ class _FakeScheduler:
         return [1e-6]
 
 
-def _fsdp_training_step_status(use_tis: bool, monkeypatch, policy_loss_type: str = "regular") -> dict:
+def _fsdp_training_step_status(
+    use_tis: bool,
+    monkeypatch,
+    policy_loss_type: str = "regular",
+    model_cls: type = _FakeHFModel,
+    strategy: _FakeStrategy | None = None,
+) -> dict:
     old_lp, rollout_lp, loss_mask = _tis_tensors()
     worker = object.__new__(PolicyWorkerBase)
     worker.cfg = _algorithm_cfg(use_tis, policy_loss_type)
-    worker.model = _FakeHFModel(action_log_probs=old_lp + 0.01)
+    worker.model = model_cls(action_log_probs=old_lp + 0.01)
     worker.policy_loss_fn = _fake_policy_loss_fn
-    worker.strategy = _FakeStrategy()
+    worker.strategy = strategy if strategy is not None else _FakeStrategy()
     worker.optimizer = None
     worker.scheduler = _FakeScheduler()
     worker.record_memory = False
@@ -198,6 +227,15 @@ def test_fsdp_behavior_clip_keeps_rollout_divergence_diagnostics(monkeypatch):
 def test_fsdp_training_step_completes_clip_metric_contract(monkeypatch):
     status = _fsdp_training_step_status(use_tis=False, monkeypatch=monkeypatch)
     assert {key: status[key] for key in POLICY_CLIP_METRIC_KEYS} == dict.fromkeys(POLICY_CLIP_METRIC_KEYS, 0.0)
+
+
+def test_fsdp_training_step_releases_logits_before_backward(monkeypatch):
+    """The [B, S, V] logits are the largest live tensor of the step and the loss
+    only needs the sliced logprobs and entropy, so the step must not keep them
+    alive through backward (15.8 GB bf16 at S=61k)."""
+    strategy = _LogitsWatchingStrategy()
+    _fsdp_training_step_status(use_tis=False, monkeypatch=monkeypatch, model_cls=_LogitsHFModel, strategy=strategy)
+    assert strategy.logits_alive_at_backward is False
 
 
 # ---------------------------------------------------------------------------

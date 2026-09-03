@@ -1240,6 +1240,14 @@ class PolicyWorkerBase(Worker):
                 scaling=LossScaling.CALLER,
                 global_loss_denom=(experience.metadata or {}).get(GLOBAL_LOSS_DENOM_METADATA_KEY),
             )
+        # The forward's output still references the full [B, S, V] logits (15.8 GB
+        # bf16 at S=61k) and nothing below reads them: the loss is built from the
+        # sliced logprobs and entropy above. Drop the reference before backward so
+        # the buffer is released once the LM-head backward has consumed it (the
+        # flash-attn cross-entropy backward writes its gradient into that same
+        # buffer in place) instead of staying pinned through the whole transformer
+        # backward and the optimizer step.
+        del output
         _phase_diagnostics.log_phase(_phase_diagnostics.CollectivePhase.MODEL_FORWARD_EXIT)
         loss = objective.optimization_loss
         policy_loss = objective.policy_loss
@@ -1351,6 +1359,10 @@ class PolicyWorkerBase(Worker):
             "policy_loss": policy_loss.item(),
             "policy_lr": self.scheduler.get_last_lr()[0],
             "policy_entropy": entropy.item(),
+            # This rank's CUDA high-water mark since process start, in GB (never
+            # reset, so a step-over-step rise names the step that set a new peak);
+            # the status all_reduce averages it over the DP ranks.
+            "peak_memory_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
         }
         status.update(objective.metrics)
         # Per-token log-ratio diagnostics — visibility into which tokens

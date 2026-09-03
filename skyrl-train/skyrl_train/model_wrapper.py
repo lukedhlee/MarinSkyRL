@@ -1074,7 +1074,11 @@ class HFModelWrapper(nn.Module):
         )
 
         logits_BSV = output["logits"]
-        logits_BSV.div_(temperature)
+        # Skip the in-place scale at temperature 1.0: dividing by one is exact, and
+        # the DivBackward it would record allocates a second full [B, S, V] gradient
+        # tensor at the LM-head backward (15.8 GB bf16 at S=61k) for identical values.
+        if temperature != 1.0:
+            logits_BSV.div_(temperature)
 
         # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
         # Under CP `logits_BSV` is sequence-sharded `[B, S/cp, V]` and
