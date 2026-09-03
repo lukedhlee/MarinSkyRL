@@ -597,6 +597,27 @@ def create_ray_wrapped_inference_engines(
                 )
                 if inference_engine_runtime_env is not None:
                     engine_options["runtime_env"] = inference_engine_runtime_env
+                # Deterministic, non-ephemeral vLLM-internal ports per (engine, dp_rank) actor.
+                # vLLM's ParallelConfig picks the DP-group master ports with get_open_ports_list():
+                # a bind(0)/release probe whose kernel-assigned EPHEMERAL port any outgoing
+                # connection on the node can re-use before the EngineCore listens on it. On
+                # Jupiter (16 engine nodes x DP4xEP4, 2026-09-03) that raised EADDRINUSE on
+                # 5-13 ranks per job, and the per-actor retry of a 4-rank DP group left about
+                # half of the affected nodes hung (3 ranks spinning in the EP all-to-all, 1 idle,
+                # no request ever served). With VLLM_PORT set, vLLM scans upward from a fixed
+                # base instead. Bases are spaced 20 apart per actor (5 DP ports + executor
+                # ports) in 30000-32559: above SkyRL's rendezvous range (20000-29999) and below
+                # the default ephemeral range (32768-60999). Only actors on the same node can
+                # collide, and a node hosts at most a few consecutive actor indices, so the
+                # mod-128 wrap is safe. Set SKYRL_VLLM_PORT_BASE=0 to disable.
+                _vllm_port_base = int(os.environ.get("SKYRL_VLLM_PORT_BASE", "30000"))
+                if _vllm_port_base > 0:
+                    _actor_env = dict(engine_options.get("runtime_env") or {})
+                    _actor_env["env_vars"] = {
+                        **_actor_env.get("env_vars", {}),
+                        "VLLM_PORT": str(_vllm_port_base + ((i * data_parallel_size + dp_rank) % 128) * 20),
+                    }
+                    engine_options["runtime_env"] = _actor_env
                 engine = actor_class.options(**engine_options).remote(
                     model=pretrain,
                     enforce_eager=enforce_eager,
