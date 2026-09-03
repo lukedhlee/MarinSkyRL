@@ -17,7 +17,7 @@ from skyrl_train.inference_engines.base import (
     NamedWeightsUpdateRequest,
 )
 from skyrl_train.inference_engines.vllm.stats import IntervalReadMode
-from skyrl_train.inference_engines.utils import get_rendezvous_addr_port
+from skyrl_train.inference_engines.utils import get_pg_bundle_node_ips, get_rendezvous_addr_port
 from skyrl_train.models.grug_moe import GRUG_MOE_ARCHITECTURE, GRUG_MOE_MODEL_TYPE
 from skyrl_train.env_vars import EnvVarScope, managed_environment_names
 from skyrl_train.utils import (
@@ -415,6 +415,7 @@ def create_ray_wrapped_inference_engines(
         use_mp_backend=use_mp_backend,
         tensor_parallel_size=tensor_parallel_size,
         pipeline_parallel_size=pipeline_parallel_size,
+        data_parallel_size=data_parallel_size,
     )
     if not use_hybrid_engine:
         if use_mp_backend:
@@ -458,6 +459,37 @@ def create_ray_wrapped_inference_engines(
             bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_inference_engines * per_engine_gpu_count)]
             shared_pg = placement_group(bundles, strategy="PACK")
             get_ray_pg_ready_with_timeout(shared_pg, timeout=placement_group_timeout_seconds)
+
+    if data_parallel_size > 1:
+        # Every DP rank of an engine must sit on ONE node: the ranks form a single vLLM
+        # DP/EP group, and its expert-parallel all-to-all runs every decode step. A DP
+        # group split across nodes silently runs that collective over the fabric and, on
+        # Jupiter (GH200, CUDA graphs on, 2026-09-03), deadlocked at the first forward on
+        # every split engine with no error logged. Fail loudly here instead; log the
+        # (engine, DP rank) -> node map so a bad layout is visible in the first minute.
+        for i in range(num_inference_engines):
+            if use_hybrid_engine:
+                check_pg = shared_pg
+                check_indices = [colocated_engine_bundles[i * data_parallel_size + r][0] for r in range(data_parallel_size)]
+            elif per_engine_pgs:
+                check_pg = per_engine_pgs[i]
+                check_indices = [r * tp_pp_size for r in range(data_parallel_size)]
+            elif use_mp_backend:
+                check_pg = shared_pg
+                check_indices = [i * data_parallel_size + r for r in range(data_parallel_size)]
+            else:
+                check_pg = shared_pg
+                check_indices = [i * per_engine_gpu_count + r * tp_pp_size for r in range(data_parallel_size)]
+            node_ips = get_pg_bundle_node_ips(check_pg, check_indices)
+            logger.info(f"inference engine {i}: DP rank -> node {dict(enumerate(node_ips))}")
+            if len(set(node_ips)) > 1 and os.environ.get("SKYRL_ALLOW_CROSS_NODE_DP", "0") != "1":
+                raise RuntimeError(
+                    f"inference engine {i}: its {data_parallel_size} DP ranks were placed on "
+                    f"{len(set(node_ips))} nodes ({dict(enumerate(node_ips))}). A DP/EP group must be "
+                    "node-local (its expert-parallel all-to-all runs every decode step and deadlocks "
+                    "across nodes under CUDA graphs on GH200). Use the ray/uni backend (per-engine "
+                    "STRICT_PACK) or set SKYRL_ALLOW_CROSS_NODE_DP=1 to proceed anyway."
+                )
 
     allocated_rendezvous_ports: set[int] = set()
     for i in range(num_inference_engines):

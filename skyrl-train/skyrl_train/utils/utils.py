@@ -228,9 +228,22 @@ def use_per_engine_strict_pack_pg(
     use_mp_backend: bool,
     tensor_parallel_size: int,
     pipeline_parallel_size: int,
+    data_parallel_size: int = 1,
 ) -> bool:
     """Whether the ray/uni inference backend should build one STRICT_PACK
     placement group PER ENGINE (vs a single flat PACK PG over all engines).
+
+    DP>1 engines (``inference_engine_data_parallel_size > 1``, one single-GPU
+    actor per DP rank) are multi-GPU engines too: their DP ranks form one vLLM
+    DP/EP group whose expert-parallel all-to-all runs every decode step. The flat
+    PACK PG gives them no node affinity either — on Jupiter (4xGH200 nodes,
+    2026-09-03) an 8-engine DP4xEP4 job landed EVERY engine's DP rank 0 on one
+    node and its ranks 1-3 on another, and the cross-node EP collective then
+    deadlocked at the first forward under CUDA graphs (3 GPUs spinning in the
+    all-gather, rank 0 idle, no error); 4-engine jobs only worked because PACK
+    happened to align their bundles to nodes. So the gate is
+    ``tp * pp * dp > 1``, and the per-engine PG holds all ``tp * pp * dp``
+    bundles of the engine (STRICT_PACK = one node).
 
     Pure (Ray-free) predicate so the placement decision is unit-testable. The
     per-engine STRICT_PACK guarantees each multi-GPU engine's bundles co-locate
@@ -253,7 +266,7 @@ def use_per_engine_strict_pack_pg(
     """
     if use_hybrid_engine or use_mp_backend:
         return False
-    return (tensor_parallel_size * pipeline_parallel_size) > 1
+    return (tensor_parallel_size * pipeline_parallel_size * data_parallel_size) > 1
 
 
 class Timer:

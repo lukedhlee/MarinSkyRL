@@ -258,3 +258,24 @@ def get_rendezvous_addr_port(placement_group, pg_index: int, excluded_ports: Col
         get_addr_port.options(scheduling_strategy=master_sched).remote()
     )
     return data_parallel_address, data_parallel_rpc_port
+
+
+def get_pg_bundle_node_ips(placement_group, pg_indices: Collection[int]) -> List[str]:
+    """Node IP of each bundle index of `placement_group`, via zero-resource probe tasks
+    pinned to the bundles (same mechanism as `get_rendezvous_addr_port`)."""
+
+    @ray.remote(num_cpus=0, num_gpus=0)
+    def get_node_ip():
+        return ray.util.get_node_ip_address()
+
+    refs = [
+        get_node_ip.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=placement_group,
+                placement_group_capture_child_tasks=True,
+                placement_group_bundle_index=idx,
+            )
+        ).remote()
+        for idx in pg_indices
+    ]
+    return list(ray.get(refs))
