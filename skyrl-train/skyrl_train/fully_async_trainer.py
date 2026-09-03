@@ -678,7 +678,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         # sync weights to inference engines
         with Timer("sync_weights_to_inference_engines", self.all_startup_timings) as weight_update_timer:
-            await self.async_sync_policy_weights_to_inference_engines()
+            # Diagnostic switch (Jupiter DP4xEP4 first-step engine hang, 2026-09-03): at step 0 the
+            # policy holds the same checkpoint the engines loaded from disk, so the startup sync
+            # is a no-op numerically; skipping it isolates "weight sync + CUDA graphs" from
+            # "first forward under DP" as the hang trigger. Off by default; never set for a run
+            # that resumes from a checkpoint (the engines would keep the base weights).
+            if os.environ.get("SKYRL_SKIP_STARTUP_WEIGHT_SYNC", "0") == "1":
+                logger.warning("SKYRL_SKIP_STARTUP_WEIGHT_SYNC=1: skipping the startup policy->engine weight sync")
+            else:
+                await self.async_sync_policy_weights_to_inference_engines()
             # Drain the policy workers' event loops to a hard sync point so every FSDP
             # shard rank is free before the step-1 forward is dispatched (the MoE-RL
             # async-dispatch wedge fix). See _drain_policy_event_loops.
