@@ -27,7 +27,9 @@ from skyrl_train.utils.logging_utils import log_exception_as_text
 from skyrl_train.trajectory_runners.trajectory_processing import (
     prepare_trajectory_request,
     concatenate_trajectory_batches,
+    get_outcome_rewards,
 )
+from skyrl_train.trajectory_runners.trajectory_reward_shaping import NormalizedReward
 from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
 from dataclasses import dataclass, field
 from skyrl_train.utils.data_tracker import DataConsumptionTracker
@@ -166,11 +168,53 @@ class _AdmissionPartition:
 
 
 @dataclass
+class _DynamicSamplingCandidateMetrics:
+    group_count: int = 0
+    trajectory_count: int = 0
+    optimization_reward_sum: float = 0.0
+    outcome_reward_sum: float = 0.0
+    passed_group_count: int = 0
+    samples_per_group: int | None = None
+
+    def observe(self, batch: TrajectoryBatch) -> None:
+        rewards = batch["rewards"]
+        outcomes = get_outcome_rewards(batch)
+        group_size = len(outcomes)
+        if self.samples_per_group is None:
+            self.samples_per_group = group_size
+        elif self.samples_per_group != group_size:
+            raise ValueError(
+                "dynamic sampling candidates must have a consistent physical group size: "
+                f"got {self.samples_per_group} and {group_size}"
+            )
+        self.group_count += 1
+        self.trajectory_count += group_size
+        self.optimization_reward_sum += sum(NormalizedReward.from_output(reward).total for reward in rewards)
+        self.outcome_reward_sum += sum(outcomes)
+        self.passed_group_count += int(any(reward > 0.0 for reward in outcomes))
+
+    def merge(self, other: "_DynamicSamplingCandidateMetrics") -> None:
+        if other.samples_per_group is not None:
+            if self.samples_per_group is None:
+                self.samples_per_group = other.samples_per_group
+            elif self.samples_per_group != other.samples_per_group:
+                raise ValueError(
+                    "dynamic sampling candidates changed physical group size within a training step: "
+                    f"got {self.samples_per_group} and {other.samples_per_group}"
+                )
+        self.group_count += other.group_count
+        self.trajectory_count += other.trajectory_count
+        self.optimization_reward_sum += other.optimization_reward_sum
+        self.outcome_reward_sum += other.outcome_reward_sum
+        self.passed_group_count += other.passed_group_count
+
+
+@dataclass
 class _CandidateSelection:
     admitted_groups: List[GeneratedOutputGroup]
     surplus_groups: List[GeneratedOutputGroup]
     discarded_reasons: collections.Counter[str]
-    candidate_count: int
+    candidate_metrics: _DynamicSamplingCandidateMetrics
 
 
 class _AsyncStalenessManager:
@@ -1263,7 +1307,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             discarded_groups=discarded_groups,
         )
 
-    def _publish_admission_metrics(self, *, dynamic_candidate_count: int, dynamic_discarded_count: int) -> None:
+    def _publish_admission_metrics(
+        self,
+        *,
+        dynamic_candidate_metrics: _DynamicSamplingCandidateMetrics,
+        dynamic_discarded_count: int,
+    ) -> None:
         rejected = self._groups_rejected_since_step
         inspected = self._groups_inspected_since_step
         assert inspected > 0, "An admitted training batch requires at least one inspected completed group"
@@ -1276,14 +1325,26 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             "async/rejected_rate": rejected / inspected,
         }
         if self._dynamic_sampling_type is DynamicSamplingType.FILTER:
+            candidate_count = dynamic_candidate_metrics.group_count
+            trajectory_count = dynamic_candidate_metrics.trajectory_count
+            assert candidate_count > 0 and trajectory_count > 0
             metrics.update(
                 {
-                    "async/dynamic_sampling/candidate_count": dynamic_candidate_count,
+                    "async/dynamic_sampling/candidate_count": candidate_count,
                     "async/dynamic_sampling/discarded_count": dynamic_discarded_count,
-                    "async/dynamic_sampling/discarded_rate": (
-                        dynamic_discarded_count / dynamic_candidate_count if dynamic_candidate_count else 0.0
+                    "async/dynamic_sampling/discarded_rate": (dynamic_discarded_count / candidate_count),
+                    "async/dynamic_sampling/candidate_trajectory_count": trajectory_count,
+                    "async/dynamic_sampling/candidate_optimization_reward_mean": (
+                        dynamic_candidate_metrics.optimization_reward_sum / trajectory_count
+                    ),
+                    "async/dynamic_sampling/candidate_outcome_reward_mean": (
+                        dynamic_candidate_metrics.outcome_reward_sum / trajectory_count
                     ),
                 }
+            )
+            assert dynamic_candidate_metrics.samples_per_group is not None
+            metrics[f"async/dynamic_sampling/candidate_pass_at_{dynamic_candidate_metrics.samples_per_group}"] = (
+                dynamic_candidate_metrics.passed_group_count / candidate_count
             )
         metrics.update(
             {f"async/rejected_count/{reason.value}": reason_counts[reason.value] for reason in AdmissionRejection}
@@ -1297,7 +1358,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             )
         if dynamic_discarded_count:
             logger.info(
-                f"Dynamic sampling discarded {dynamic_discarded_count} of {dynamic_candidate_count} "
+                f"Dynamic sampling discarded {dynamic_discarded_count} of {candidate_count} "
                 f"candidate groups before step {self.global_step}."
             )
 
@@ -1337,7 +1398,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
     ) -> _CandidateSelection:
         admitted_groups = []
         discarded_reasons: collections.Counter[str] = collections.Counter()
-        candidate_count = 0
+        candidate_metrics = _DynamicSamplingCandidateMetrics()
 
         for candidate_index, group in enumerate(candidates):
             if len(admitted_groups) >= available_slots:
@@ -1345,11 +1406,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     admitted_groups=admitted_groups,
                     surplus_groups=candidates[candidate_index:],
                     discarded_reasons=discarded_reasons,
-                    candidate_count=candidate_count,
+                    candidate_metrics=candidate_metrics,
                 )
 
             selection_result = self._group_selection_policy.evaluate(group)
-            candidate_count += int(self._dynamic_sampling_type is DynamicSamplingType.FILTER)
+            if self._dynamic_sampling_type is DynamicSamplingType.FILTER:
+                candidate_metrics.observe(group.trajectory_batch)
             if selection_result is GroupSelectionResult.KEEP:
                 admitted_groups.append(group)
             else:
@@ -1359,7 +1421,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             admitted_groups=admitted_groups,
             surplus_groups=[],
             discarded_reasons=discarded_reasons,
-            candidate_count=candidate_count,
+            candidate_metrics=candidate_metrics,
         )
 
     async def _get_admitted_generation_group_mini_batch(self, queues: _GenerationQueues) -> List[GeneratedOutputGroup]:
@@ -1376,7 +1438,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         last_admitted_progress = loop.time()
         stall_timeout = float(self.admission_stall_timeout)
         rejection_counts_since_admission: collections.Counter[str] = collections.Counter()
-        dynamic_candidate_count = 0
+        dynamic_candidate_metrics = _DynamicSamplingCandidateMetrics()
         dynamic_discarded_count = 0
 
         while True:
@@ -1386,7 +1448,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         raise GenerationStalledError(
                             "Generation exhausted its dataset before assembling a complete training batch: "
                             f"admitted={len(accepted_groups)}/{self.mini_batch_size}, "
-                            f"dynamic_candidates={dynamic_candidate_count}, "
+                            f"dynamic_candidates={dynamic_candidate_metrics.group_count}, "
                             f"dynamic_discarded={dynamic_discarded_count}, "
                             f"rejections={dict(rejection_counts_since_admission)}"
                         )
@@ -1423,7 +1485,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     available_slots=self.mini_batch_size - len(accepted_groups),
                 )
                 queues.record_admitted(selection.admitted_groups)
-                dynamic_candidate_count += selection.candidate_count
+                dynamic_candidate_metrics.merge(selection.candidate_metrics)
                 dynamic_discarded_this_scan = sum(selection.discarded_reasons.values())
                 dynamic_discarded_count += dynamic_discarded_this_scan
                 rejection_counts_since_admission.update(selection.discarded_reasons)
@@ -1455,7 +1517,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             if (
                 batch is None
                 and self._dynamic_sampling_max_candidate_groups is not None
-                and dynamic_candidate_count >= self._dynamic_sampling_max_candidate_groups
+                and dynamic_candidate_metrics.group_count >= self._dynamic_sampling_max_candidate_groups
             ):
                 raise RuntimeError(
                     "Exiting training loop due to hitting dynamic sampling limit for filter strategy with "
@@ -1467,7 +1529,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 break
 
         self._publish_admission_metrics(
-            dynamic_candidate_count=dynamic_candidate_count,
+            dynamic_candidate_metrics=dynamic_candidate_metrics,
             dynamic_discarded_count=dynamic_discarded_count,
         )
         return batch
