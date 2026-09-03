@@ -470,7 +470,9 @@ def create_ray_wrapped_inference_engines(
         for i in range(num_inference_engines):
             if use_hybrid_engine:
                 check_pg = shared_pg
-                check_indices = [colocated_engine_bundles[i * data_parallel_size + r][0] for r in range(data_parallel_size)]
+                check_indices = [
+                    colocated_engine_bundles[i * data_parallel_size + r][0] for r in range(data_parallel_size)
+                ]
             elif per_engine_pgs:
                 check_pg = per_engine_pgs[i]
                 check_indices = [r * tp_pp_size for r in range(data_parallel_size)]
