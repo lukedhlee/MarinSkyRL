@@ -1,6 +1,9 @@
 import json
 from typing import Any, Dict, Protocol
 
+# Values vLLM's chat renderer accepts for ``chat_template_content_format``.
+CHAT_TEMPLATE_CONTENT_FORMATS = ("auto", "string", "openai")
+
 
 class PrefixCacheStatsLike(Protocol):
     """The token counters vLLM's `PrefixCacheStats` carries for one scheduler iteration."""
@@ -67,6 +70,19 @@ def pop_openai_kwargs(engine_kwargs: Dict[str, Any]) -> Dict[str, Any]:
     openai_sampling = engine_kwargs.pop("openai_sampling_params", None)
     if openai_sampling is not None:
         openai_kwargs["openai_sampling_params"] = openai_sampling
+
+    # How vLLM's renderer hands message content to the chat template. Unset leaves vLLM's
+    # ``auto``, which sniffs the template and may pick the OpenAI parts format; a template
+    # can render parts differently from a plain string (Snowball's emits an extra newline
+    # after each assistant EOT), so ``string`` / ``openai`` pin the format via
+    # ``++generator.engine_init_kwargs.chat_template_content_format=...``.
+    content_format = engine_kwargs.pop("chat_template_content_format", None)
+    if content_format is not None:
+        if content_format not in CHAT_TEMPLATE_CONTENT_FORMATS:
+            raise ValueError(
+                f"chat_template_content_format must be one of {CHAT_TEMPLATE_CONTENT_FORMATS}, got {content_format!r}"
+            )
+        openai_kwargs["chat_template_content_format"] = content_format
 
     return openai_kwargs
 
