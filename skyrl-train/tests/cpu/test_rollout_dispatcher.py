@@ -288,7 +288,13 @@ class _KwargsRemoteMethod:
     def remote(self, *args, **kwargs):
         self._log.append((self._name, args, kwargs))
 
+        request = next(
+            (a for a in list(args) + list(kwargs.values()) if isinstance(a, dict) and a.get("trajectory_ids")), None
+        )
+
         async def _done():
+            if request is not None:
+                return _output(list(request["trajectory_ids"]))
             return {"response_ids": [[1]], "rollout_metrics": {}}
 
         return _done()
@@ -302,23 +308,16 @@ class _EvalCoordinator:
         self.stop_eval_session = _KwargsRemoteMethod(self.calls, "stop_eval_session")
 
 
-def _fanout_dispatcher(actors: list) -> RolloutDispatcher:
-    dispatcher = RolloutDispatcher(
-        cfg=OmegaConf.create({}),
-        trajectory_runner_cfg=OmegaConf.create({}),
-        terminal_bench_cfg=OmegaConf.create({}),
-        num_coordinators=len(actors),
-        cpus_per_coordinator=1,
-        coordinator_rpc_timeout=5,
-    )
+def _fanout_dispatcher(actors: list, harbor_runner_spec: HarborRunnerSpec) -> RolloutDispatcher:
+    dispatcher = _dispatcher(actors, harbor_runner_spec, timeout=5)
     dispatcher._actors = actors
     return dispatcher
 
 
 @pytest.mark.asyncio
-async def test_eval_session_broadcasts_to_all_coordinators():
+async def test_eval_session_broadcasts_to_all_coordinators(harbor_runner_spec):
     actors = [_EvalCoordinator() for _ in range(3)]
-    dispatcher = _fanout_dispatcher(actors)
+    dispatcher = _fanout_dispatcher(actors, harbor_runner_spec)
 
     await dispatcher.start_eval_session(run_name="r", eval_step=7, val_set_name="v")
     for actor in actors:
@@ -334,18 +333,20 @@ async def test_eval_session_broadcasts_to_all_coordinators():
 
 
 @pytest.mark.asyncio
-async def test_eval_groups_round_robin_across_coordinators():
+async def test_eval_groups_round_robin_across_coordinators(harbor_runner_spec):
     actors = [_EvalCoordinator() for _ in range(3)]
-    dispatcher = _fanout_dispatcher(actors)
+    dispatcher = _fanout_dispatcher(actors, harbor_runner_spec)
     await dispatcher.start_eval_session(run_name="r", eval_step=0, val_set_name=None)
 
+    counter = iter(range(100))
+
     for _ in range(6):
-        await dispatcher.run({"prompts": ["task"]})
+        await dispatcher.run(_request([TrajectoryID(f"task-{next(counter)}", 0)]))
 
     per_actor = [sum(1 for c in actor.calls if c[0] == "run_shard") for actor in actors]
     assert per_actor == [2, 2, 2]
 
 
-def test_dispatcher_advertises_concurrent_eval():
-    dispatcher = _fanout_dispatcher([_EvalCoordinator()])
+def test_dispatcher_advertises_concurrent_eval(harbor_runner_spec):
+    dispatcher = _fanout_dispatcher([_EvalCoordinator()], harbor_runner_spec)
     assert dispatcher.supports_concurrent_eval is True
