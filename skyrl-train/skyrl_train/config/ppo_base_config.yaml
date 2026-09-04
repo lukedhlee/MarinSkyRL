@@ -248,6 +248,14 @@ trainer:
       cispo_eps_clip_low: 0
       cispo_eps_clip_high: 5
 
+    # DPPO (policy_loss_type="dppo", upstream SkyRL port; https://arxiv.org/abs/2602.04879).
+    # dppo_type: "binary_tv" or "binary_kl"; deltas are the divergence thresholds for
+    # negative (delta_low) / positive (delta_high) advantages (0.2 for TV, 0.05 for KL recommended).
+    dppo:
+      dppo_type: "binary_tv"
+      delta_low: 0.2
+      delta_high: 0.2
+
     z_clip:
       enabled: false
       alpha: 0.97

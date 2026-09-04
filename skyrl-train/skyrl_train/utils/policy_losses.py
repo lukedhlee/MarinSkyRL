@@ -17,13 +17,14 @@ from omegaconf import DictConfig
 from skyrl_train.utils.importance_ratio_diagnostics import compute_tis_diagnostics
 from skyrl_train.utils.loss_reduction import (
     GLOBAL_SEQUENCE_MEAN_TOKEN_SUM_NORMALIZED_LOSS_REDUCTION,
+    PRESCALED_SUM_LOSS_REDUCTIONS,
     SEQUENCE_MEAN_LOSS_REDUCTION,
     SUPPORTED_LOSS_REDUCTIONS,
     LossReduction,
     build_think_weighted_loss_mask,
     reduce_loss,
 )
-from skyrl_train.utils.algorithm_registry import PolicyLossType, register_policy_loss
+from skyrl_train.utils.algorithm_registry import ROLLOUT_LOGPROB_POLICY_LOSSES, PolicyLossType, register_policy_loss
 from skyrl_train.utils.policy_math import LOG_PROB_DELTA_CLIP, compute_approx_kl, masked_mean, safe_exp_delta
 
 
@@ -167,7 +168,8 @@ def _scale_policy_objective(
     scaling: LossScaling,
     loss_reduction: LossReduction,
 ) -> torch.Tensor:
-    globally_normalized = loss_reduction == GLOBAL_SEQUENCE_MEAN_TOKEN_SUM_NORMALIZED_LOSS_REDUCTION
+    # Pre-scaled sums (seq_mean_token_sum_norm_global, prompt_mean) already span the accumulation window.
+    globally_normalized = loss_reduction in PRESCALED_SUM_LOSS_REDUCTIONS
     if scaling is LossScaling.MEGATRON_PIPELINE:
         # Megatron Core divides the closure result by the number of microbatches.
         # A globally normalized policy term already spans that window, so multiply
@@ -190,7 +192,7 @@ def _policy_objective_metrics(
     config: DictConfig,
 ) -> dict[str, float]:
     metrics = complete_clip_metrics(policy_loss_metrics)
-    if config.use_tis or config.get("policy_loss_type") == PolicyLossType.BEHAVIOR_CLIP:
+    if config.use_tis or config.get("policy_loss_type") in ROLLOUT_LOGPROB_POLICY_LOSSES:
         metrics.update(
             compute_tis_diagnostics(
                 old_action_log_probs,
@@ -369,6 +371,85 @@ def behavior_clipped_policy_loss(
 
     pg_loss3 = torch.sign(advantages) * config.clip_ratio_c * advantages
     loss = torch.where(advantages < 0, torch.minimum(loss, pg_loss3), loss)
+    loss = reduce_loss(
+        loss,
+        loss_mask,
+        config.loss_reduction,
+        config.max_seq_len,
+        global_denom=global_loss_denom,
+    )
+    return loss, clip_metrics
+
+
+@register_policy_loss(PolicyLossType.DPPO)
+def dppo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    config: DictConfig,
+    loss_mask: Optional[torch.Tensor] = None,
+    rollout_logprobs: Optional[torch.Tensor] = None,
+    global_loss_denom: Optional[float] = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Divergence Proximal Policy Optimization (DPPO) policy loss.
+
+    Replaces PPO's ratio clipping with a divergence-based binary token mask against the
+    behavior (rollout) policy: ``loss = -(ratio * A * m)`` with ``ratio = exp(logp - rollout_logp)``
+    (gradient flows through the ratio) and, for ``binary_tv``, ``m = 0`` iff
+    ``(A > 0 and p - p_rollout > delta_high)`` or ``(A < 0 and p_rollout - p > delta_low)``
+    in probability space. ``binary_kl`` masks on the binary KL instead. The mask is computed
+    without gradient. Ported from upstream SkyRL ``dppo_policy_loss`` (commit b8a5caaa);
+    see https://arxiv.org/abs/2602.04879 and
+    https://github.com/sail-sg/Stable-RL/blob/main/verl/trainer/ppo/core_algos.py#L1241.
+
+    Unlike upstream, this fork does not fall back to ``old_log_probs`` when rollout logprobs are
+    missing: like ``behavior_clip`` it requires them (the trainer forces
+    ``generator.sampling_params.logprobs=0``), and it rejects ``use_tis`` because both correct
+    against ``rollout_logprobs``.
+    """
+    del old_log_probs
+    if rollout_logprobs is None:
+        raise ValueError("rollout_logprobs are required for dppo policy loss")
+    if config.use_tis:
+        raise ValueError("dppo cannot be combined with use_tis; both correct against rollout_logprobs")
+    if config.loss_reduction not in SUPPORTED_LOSS_REDUCTIONS:
+        raise ValueError(f"loss_reduction must be one of {list(SUPPORTED_LOSS_REDUCTIONS)}")
+    dppo_type = str(config.dppo.dppo_type)
+    delta_low = float(config.dppo.delta_low)
+    delta_high = float(config.dppo.delta_high)
+
+    # Ratio and mask are both taken against the behavior policy (paper section 5.2).
+    ratio = safe_exp_delta(log_probs - rollout_logprobs, out_dtype=log_probs.dtype)
+
+    with torch.no_grad():
+        current_probs = torch.exp(log_probs)
+        mu_probs = torch.exp(rollout_logprobs)
+        prob_diff = current_probs - mu_probs  # divergence measured in probability space
+        mask = torch.ones_like(advantages)
+        if dppo_type == "binary_tv":
+            # Binary total variation (paper eq. 13)
+            mask[(advantages > 0) & (prob_diff > delta_high)] = 0.0
+            mask[(advantages < 0) & (-prob_diff > delta_low)] = 0.0
+        elif dppo_type == "binary_kl":
+            # Binary KL (paper eq. 14)
+            eps = 1e-8
+            binary_kl = mu_probs * (rollout_logprobs - log_probs) + (1 - mu_probs) * torch.log(
+                (1 - mu_probs + eps) / (1 - current_probs + eps)
+            )
+            mask[(advantages > 0) & (prob_diff > 0) & (binary_kl > delta_high)] = 0.0
+            mask[(advantages < 0) & (prob_diff < 0) & (binary_kl > delta_low)] = 0.0
+        else:
+            raise ValueError(f"Unknown DPPO type: {dppo_type}. Must be 'binary_tv' or 'binary_kl'.")
+
+    loss = -(ratio * advantages * mask)
+    # `ppo_clip_ratio` is the fraction of loss tokens the divergence mask zeroed (upstream's `clip_ratio`).
+    clip_metrics = clipping_metrics(
+        ratio,
+        mask == 0,
+        loss_mask,
+        eps_clip_low=config.eps_clip_low,
+        eps_clip_high=config.eps_clip_high,
+    )
     loss = reduce_loss(
         loss,
         loss_mask,

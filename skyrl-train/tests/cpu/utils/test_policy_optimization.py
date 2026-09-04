@@ -305,7 +305,7 @@ def _validatable_dummy_config():
 
 @pytest.mark.parametrize(
     "loss_reduction",
-    ["token_mean", "sequence_mean", "seq_mean_token_sum_norm", "seq_mean_token_sum_norm_global"],
+    ["token_mean", "sequence_mean", "seq_mean_token_sum_norm", "seq_mean_token_sum_norm_global", "prompt_mean"],
 )
 def test_validate_cfg_accepts_all_loss_reductions(loss_reduction):
     """Config-validation smoke: validate_cfg must NOT reject any supported loss_reduction.
@@ -385,7 +385,7 @@ def _mask_sum_policy_loss(
     return (log_probs * loss_mask).sum(), {}
 
 
-@pytest.mark.parametrize("loss_reduction", ["token_mean", "seq_mean_token_sum_norm_global"])
+@pytest.mark.parametrize("loss_reduction", ["token_mean", "seq_mean_token_sum_norm_global", "prompt_mean"])
 def test_policy_objective_scheduler_and_caller_scaling_have_gradient_parity(loss_reduction):
     config = OmegaConf.create(
         {
@@ -434,8 +434,9 @@ def test_policy_objective_scheduler_and_caller_scaling_have_gradient_parity(loss
     torch.testing.assert_close(scheduler_log_probs.grad, caller_log_probs.grad, rtol=0, atol=0)
     assert caller.unscaled_loss.item() == pytest.approx(3.0)
     assert scheduler.unscaled_loss.item() == pytest.approx(3.0)
-    expected_caller_loss = 3.0 if loss_reduction == "seq_mean_token_sum_norm_global" else 1.0
-    expected_scheduler_loss = 9.0 if loss_reduction == "seq_mean_token_sum_norm_global" else 3.0
+    prescaled_sum = loss_reduction in ("seq_mean_token_sum_norm_global", "prompt_mean")
+    expected_caller_loss = 3.0 if prescaled_sum else 1.0
+    expected_scheduler_loss = 9.0 if prescaled_sum else 3.0
     assert caller.optimization_loss.item() == pytest.approx(expected_caller_loss)
     assert scheduler.optimization_loss.item() == pytest.approx(expected_scheduler_loss)
     assert "global_loss_denom" not in config
@@ -737,6 +738,7 @@ def test_package_initialization_registers_complete_builtin_algorithm_sets():
         "clip_cov",
         "kl_cov",
         "sapo",
+        "dppo",
     }
     assert set(AdvantageEstimatorRegistry.list_available()) >= {
         "gae",
