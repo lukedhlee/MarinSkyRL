@@ -3,7 +3,7 @@ from difflib import SequenceMatcher
 from typing import List, Tuple, Union, Optional, Dict, Any, Iterable, Protocol
 from collections import defaultdict
 import numpy as np
-from skyrl_train.group_admission import group_is_fully_excluded_from_training
+from skyrl_train.group_admission import group_has_trainable_tokens
 from skyrl_train.trajectory_runners.base import (
     TrajectoryBatch,
     TrajectoryRequestBatch,
@@ -633,7 +633,13 @@ def _rollout_logprob_presence(trajectory_batches: List[TrajectoryBatch], *, requ
     if not required:
         return presence
     for output, has_logprobs in zip(trajectory_batches, presence, strict=True):
-        if not has_logprobs and not group_is_fully_excluded_from_training(output):
+        # Require behavior logprobs only where the objective will consume them: a group
+        # with no loss-bearing tokens (e.g. every trajectory a pass-through failure that
+        # still contributes its reward to the group baseline) gets aligned placeholders
+        # below, which cannot reach the loss. The harbor runner and GroupAdmissionPolicy
+        # apply the same rule; failing closed here crashed the rollout dispatcher on the
+        # first fully-failed pass-through group of a 1,536-seat band run (2026-09-04).
+        if not has_logprobs and group_has_trainable_tokens(output):
             raise ValueError("rollout_logprobs are required for every generated group")
     return presence
 

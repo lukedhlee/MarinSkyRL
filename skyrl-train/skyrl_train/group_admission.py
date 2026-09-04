@@ -218,6 +218,18 @@ def group_is_fully_excluded_from_training(trajectory_batch: Mapping[str, object]
     return facts.trainable_count == 0 and facts.baseline_contributor_count == 0
 
 
+def group_has_trainable_tokens(trajectory_batch: Mapping[str, object]) -> bool:
+    """Return whether any trajectory in the group carries loss-bearing tokens.
+
+    Behavior logprobs are only consumed by the policy objective, so a group whose
+    trajectories are all fully loss-masked (e.g. pass-through failures that still
+    count toward the group baseline) does not need them. This is the same rule
+    ``GroupAdmissionPolicy.evaluate`` and the harbor runner apply.
+    """
+    facts = _inspect_group(_BatchGroup(trajectory_batch))
+    return facts.trainable_count > 0
+
+
 class GroupAdmissionPolicy:
     """Evaluate completed groups without mutating async lifecycle state."""
 
