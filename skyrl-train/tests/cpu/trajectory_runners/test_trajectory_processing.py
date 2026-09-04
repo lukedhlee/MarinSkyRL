@@ -997,15 +997,20 @@ def test_partial_failure_metrics_are_rejected_during_concatenation():
         concatenate_trajectory_batches([group], tis_lcs_alert_threshold=0.005)
 
 
-def test_required_rollout_logprobs_reject_partial_generation_batch():
+def test_required_rollout_logprobs_mask_partial_generation_batch():
+    # A trainable group without behavior logprobs is loss-masked (not fatal) as long as
+    # some group in the batch carries logprobs; its rewards stay in the group baseline.
     with_logprobs = {**_generated_group(2, 0), "rollout_logprobs": [[-0.1, -0.2], [-0.3, -0.4]]}
 
-    with pytest.raises(ValueError, match="rollout_logprobs are required"):
-        concatenate_trajectory_batches(
-            [with_logprobs, _generated_group(2, 0)],
-            require_rollout_logprobs=True,
-            tis_lcs_alert_threshold=0.005,
-        )
+    merged = concatenate_trajectory_batches(
+        [with_logprobs, _generated_group(2, 0)],
+        require_rollout_logprobs=True,
+        tis_lcs_alert_threshold=0.005,
+    )
+
+    assert merged["loss_masks"][:2] == [[1, 1], [1, 1]]
+    assert merged["loss_masks"][2:] == [[0, 0], [0, 0]]
+    assert merged["rollout_logprobs"] == [[-0.1, -0.2], [-0.3, -0.4], [0.0, 0.0], [0.0, 0.0]]
 
 
 def test_required_rollout_logprobs_allow_fully_excluded_generation_batch():
