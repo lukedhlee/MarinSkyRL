@@ -22,7 +22,12 @@ import numpy as np
 from skyrl_train.curriculum import CurriculumSampler
 from skyrl_train.dataset import PromptDataset
 from skyrl_train.utils.tracking import Tracking
-from skyrl_train.training_batch import GLOBAL_LOSS_DENOM_METADATA_KEY, TrainingInputBatch, TrainingOutputBatch
+from skyrl_train.training_batch import (
+    GLOBAL_LOSS_DENOM_METADATA_KEY,
+    TrainingInputBatch,
+    TrainingOutputBatch,
+    per_data_parallel_batch_size,
+)
 from skyrl_train.trajectory_runners.base import (
     TrajectoryRequestBatch,
     TrajectoryBatch,
@@ -48,7 +53,10 @@ from skyrl_train.utils.kl_controllers import get_kl_controller, FixedKLControlle
 from skyrl_train.utils.advantage_estimators import compute_advantages_and_returns
 from skyrl_train.utils.loss_reduction import (
     GLOBAL_SEQUENCE_MEAN_TOKEN_SUM_NORMALIZED_LOSS_REDUCTION,
+    PROMPT_MEAN_LOSS_REDUCTION,
+    build_think_weighted_loss_mask,
     compute_global_loss_denom,
+    compute_prompt_mean_advantage_scale,
 )
 from skyrl_train.distributed.dispatch import (
     ActorInfo,
@@ -1242,7 +1250,9 @@ class RayPPOTrainer:
         )
         behavior_logprobs_required = policy_loss_requires_rollout_logprobs(self.cfg.trainer.algorithm.policy_loss_type)
         if behavior_logprobs_required and rollout_logprobs_tensor is None:
-            raise ValueError("rollout_logprobs are required for behavior_clip policy loss")
+            raise ValueError(
+                f"rollout_logprobs are required for {self.cfg.trainer.algorithm.policy_loss_type} policy loss"
+            )
 
         # sanity check for tis
         #
@@ -1665,9 +1675,46 @@ class RayPPOTrainer:
     def apply_loop_credit_and_drop_advantage_inputs(self, data: TrainingInputBatch) -> TrainingInputBatch:
         """Apply loop credit, then remove rewards, loop_advantages, and uids before worker dispatch."""
         data = self.apply_loop_advantages(data)
+        if self.cfg.trainer.algorithm.loss_reduction == PROMPT_MEAN_LOSS_REDUCTION:
+            # Must run after every additive advantage term and before `uids` (the only per-row
+            # prompt identity) is dropped: the workers never see which rows share a prompt.
+            data = self.scale_advantages_for_prompt_mean(data)
         data.pop("rewards")
         data.pop("loop_advantages", None)
         data.metadata.pop("uids")
+        return data
+
+    def scale_advantages_for_prompt_mean(self, data: TrainingInputBatch) -> TrainingInputBatch:
+        """Fold the ``prompt_mean`` weights ``1 / (num_prompts * tokens_in_prompt)`` into the advantages.
+
+        The workers reduce ``prompt_mean`` with a plain masked sum (``reduce_loss``), so the
+        per-prompt normalizer is applied here, driver-side, where ``metadata["uids"]`` still maps
+        every row to its prompt. The normalization unit is the rank-local optimizer-step slice,
+        reconstructed from the policy dp size and per-rank mini-batch size exactly as
+        ``MeshDispatch`` chunks the batch and ``ppo_train`` walks it; see
+        ``compute_prompt_mean_advantage_scale`` for the layout proof and the loud-failure checks.
+        """
+        dp_size = self.policy_model.actor_infos[0].rank.dp_size
+        mini_batch_size_per_rank = per_data_parallel_batch_size(
+            self.cfg.trainer.policy_mini_batch_size,
+            self.cfg.generator.n_samples_per_prompt,
+            dp_size,
+        )
+        # Count tokens with the same (think-weighted) mask the policy loss will reduce with.
+        loss_mask = build_think_weighted_loss_mask(
+            data["loss_mask"],
+            data.get("response_span_tags"),
+            float(self.cfg.trainer.algorithm.think_token_weight),
+        )
+        scale = compute_prompt_mean_advantage_scale(
+            loss_mask,
+            data.metadata["uids"],
+            dp_size=dp_size,
+            mini_batch_size_per_rank=mini_batch_size_per_rank,
+            pad_size=int(data.metadata.get("pad_size", 0)),
+        )
+        advantages = data["advantages"]
+        data["advantages"] = advantages * scale.to(device=advantages.device, dtype=advantages.dtype)
         return data
 
     def dump_data(self, data: TrainingInputBatch, file_name: str):

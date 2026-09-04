@@ -91,11 +91,16 @@ class PolicyLossType(StrEnum):
     CLIP_COV = "clip_cov"
     KL_COV = "kl_cov"
     SAPO = "sapo"
+    DPPO = "dppo"
+
+
+# Losses that optimize against the rollout (behavior) logprobs instead of the recomputed "old" logprobs.
+ROLLOUT_LOGPROB_POLICY_LOSSES: frozenset[str] = frozenset({PolicyLossType.BEHAVIOR_CLIP, PolicyLossType.DPPO})
 
 
 def policy_loss_requires_rollout_logprobs(policy_loss_type: str) -> bool:
     """Return whether a policy objective requires behavior-policy logprobs."""
-    return policy_loss_type == PolicyLossType.BEHAVIOR_CLIP
+    return policy_loss_type in ROLLOUT_LOGPROB_POLICY_LOSSES
 
 
 def rollout_logprobs_enabled(algorithm_config: DictConfig) -> bool:

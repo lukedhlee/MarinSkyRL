@@ -748,6 +748,14 @@ def validate_cfg(cfg: DictConfig):
             "trainer.algorithm.policy_loss_type=behavior_clip cannot be combined with use_tis=true; "
             "behavior clipping already uses the full rollout importance ratio"
         )
+    # DPPO (upstream SkyRL port): optimizes against rollout logprobs, so it mirrors behavior_clip's
+    # rollout-logprob requirements (below) and cannot stack with TIS.
+    dppo = cfg.trainer.algorithm.policy_loss_type == "dppo"
+    if dppo and cfg.trainer.algorithm.use_tis:
+        raise ValueError(
+            "trainer.algorithm.policy_loss_type=dppo cannot be combined with use_tis=true; "
+            "dppo already uses the full rollout importance ratio"
+        )
 
     if cfg.trainer.algorithm.use_tis:
         if cfg.trainer.algorithm.tis_imp_ratio_cap <= 0:
@@ -777,6 +785,24 @@ def validate_cfg(cfg: DictConfig):
             cfg.generator.sampling_params.logprobs = 0
         if cfg.generator.backend == "sglang":
             raise NotImplementedError("behavior_clip requires rollout logprobs; use the vLLM generator backend")
+
+    if dppo:
+        dppo_cfg = cfg.trainer.algorithm.get("dppo")
+        if dppo_cfg is None:
+            raise ValueError(
+                "trainer.algorithm.dppo (dppo_type, delta_low, delta_high) is required for policy_loss_type=dppo"
+            )
+        if dppo_cfg.dppo_type not in ("binary_tv", "binary_kl"):
+            raise ValueError(
+                f"Invalid trainer.algorithm.dppo.dppo_type={dppo_cfg.dppo_type!r}; must be 'binary_tv' or 'binary_kl'"
+            )
+        if cfg.generator.sampling_params.logprobs is None:
+            logger.warning(
+                "`generator.sampling_params.logprobs` is `None` but dppo requires rollout logprobs. Setting `logprobs` to 0."
+            )
+            cfg.generator.sampling_params.logprobs = 0
+        if cfg.generator.backend == "sglang":
+            raise NotImplementedError("dppo requires rollout logprobs; use the vLLM generator backend")
 
     if cfg.trainer.policy.model.lora.rank > 0:
         # LoRA enabled

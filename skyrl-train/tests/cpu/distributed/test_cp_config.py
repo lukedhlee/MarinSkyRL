@@ -84,6 +84,7 @@ RUNTIME_CONFIG_TRAINER_FIELDS = {
 }
 ADDITIVE_ALGORITHM_FIELDS = {
     "batch_invariant": False,
+    "dppo": {"dppo_type": "binary_tv", "delta_low": 0.2, "delta_high": 0.2},
 }
 ADDITIVE_DYNAMIC_SAMPLING_FIELDS = {
     "informative_on": "shaped",
