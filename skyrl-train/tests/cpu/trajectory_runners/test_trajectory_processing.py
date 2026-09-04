@@ -1048,7 +1048,29 @@ def test_required_rollout_logprobs_allow_fully_masked_baseline_contributor():
     assert merged["rollout_logprobs"] == [[-0.1, -0.2], [-0.3, -0.4], [0.0, 0.0], [0.0, 0.0]]
 
 
-def test_required_rollout_logprobs_reject_masked_group_with_trainable_tokens():
+def test_required_rollout_logprobs_mask_trainable_group_without_logprobs():
+    # All samples of one task ended in a pass-through failure that kept tokens but
+    # produced no behavior logprobs: the group is loss-masked, its rewards stay in the
+    # baseline, and the batch proceeds with aligned placeholder logprobs.
+    trainable = {**_generated_group(2, 0), "rollout_logprobs": [[-0.1, -0.2], [-0.3, -0.4]]}
+    no_logprobs = {
+        **_generated_group(2, 0),
+        "loss_masks": [[0, 0], [1, 1]],
+        "exclude_from_baseline": [False, False],
+    }
+
+    merged = concatenate_trajectory_batches(
+        [trainable, no_logprobs],
+        require_rollout_logprobs=True,
+        tis_lcs_alert_threshold=0.005,
+    )
+
+    assert merged["loss_masks"] == [[1, 1], [1, 1], [0, 0], [0, 0]]
+    assert merged["exclude_from_baseline"] == [False, False, False, False]
+    assert merged["rollout_logprobs"] == [[-0.1, -0.2], [-0.3, -0.4], [0.0, 0.0], [0.0, 0.0]]
+
+
+def test_required_rollout_logprobs_reject_when_no_group_has_logprobs():
     partially_trainable = {
         **_generated_group(2, 0),
         "loss_masks": [[0, 0], [1, 1]],

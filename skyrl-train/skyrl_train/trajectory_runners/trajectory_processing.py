@@ -628,19 +628,40 @@ def get_outcome_rewards(trajectory_batch: TrajectoryBatch) -> List[float]:
 
 
 def _rollout_logprob_presence(trajectory_batches: List[TrajectoryBatch], *, required: bool) -> List[bool]:
-    """Validate missing logprobs and return their per-group presence mask."""
+    """Validate missing logprobs and return their per-group presence mask.
+
+    When behavior logprobs are required (TIS / behavior_clip / dppo), a group that has
+    loss-bearing tokens but no logprobs cannot be weighted by the objective. Two cases:
+
+    * Some groups lack them (e.g. all eight samples of a task ended in a pass-through
+      ContextLengthExceededError: tokens kept, reward 0, no logprobs collected): mask the
+      group out of the loss in place and keep its reward-0 samples in the group baseline,
+      the same treatment the harbor runner gives other exception trajectories. Failing
+      closed here crashed 1,536- and 528-seat band runs on their first such group
+      (2026-09-04, jobs 1656421 / 1661087).
+    * Every group lacks them while some are trainable: the engine is not returning
+      logprobs at all, which is a configuration error, so raise.
+    """
     presence = [output.get("rollout_logprobs") is not None for output in trajectory_batches]
     if not required:
         return presence
-    for output, has_logprobs in zip(trajectory_batches, presence, strict=True):
-        # Require behavior logprobs only where the objective will consume them: a group
-        # with no loss-bearing tokens (e.g. every trajectory a pass-through failure that
-        # still contributes its reward to the group baseline) gets aligned placeholders
-        # below, which cannot reach the loss. The harbor runner and GroupAdmissionPolicy
-        # apply the same rule; failing closed here crashed the rollout dispatcher on the
-        # first fully-failed pass-through group of a 1,536-seat band run (2026-09-04).
-        if not has_logprobs and group_has_trainable_tokens(output):
-            raise ValueError("rollout_logprobs are required for every generated group")
+    trainable = [group_has_trainable_tokens(output) for output in trajectory_batches]
+    if not any(presence) and any(trainable):
+        raise ValueError("rollout_logprobs are required for every generated group")
+    masked_groups = 0
+    masked_trajectories = 0
+    for output, has_logprobs, has_trainable in zip(trajectory_batches, presence, trainable, strict=True):
+        if has_logprobs or not has_trainable:
+            continue
+        output["loss_masks"] = [[0] * len(mask) for mask in output["loss_masks"]]
+        masked_groups += 1
+        masked_trajectories += len(output["loss_masks"])
+    if masked_groups:
+        logger.warning(
+            f"rollout_logprobs missing for {masked_groups} generated group(s) with loss-bearing tokens "
+            f"({masked_trajectories} trajectories, typically all-sample pass-through failures); "
+            "loss-masked them and kept their rewards in the group baseline."
+        )
     return presence
 
 
