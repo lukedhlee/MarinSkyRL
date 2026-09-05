@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict, Protocol
+from typing import Any, Dict, Optional, Protocol
 
 # Values vLLM's chat renderer accepts for ``chat_template_content_format``.
 CHAT_TEMPLATE_CONTENT_FORMATS = ("auto", "string", "openai")
@@ -123,3 +123,66 @@ def ensure_token_ids_in_sse_chunk(sse_chunk: str) -> str:
     except (json.JSONDecodeError, IndexError, KeyError):
         pass
     return sse_chunk
+
+
+_OPENAI_MAX_TOKENS_KEYS = ("max_tokens", "max_completion_tokens")
+
+
+def apply_openai_max_tokens_cap(body: Dict[str, Any], max_generate_length: Optional[int]) -> bool:
+    """Bound an OpenAI-style request's completion length by the generator's ``max_generate_length``.
+
+    The native generation path already turns ``sampling_params.max_generate_length`` into vLLM's
+    ``max_tokens`` (``get_sampling_params_for_backend``); the OpenAI path used by Harbor rollouts
+    forwarded whatever the agent sent. Terminus-2 sends no ``max_tokens`` on an ordinary turn, so
+    vLLM defaulted to "fill the remaining context": a runaway completion decoded 50k+ tokens for up
+    to 17 minutes, died on the context limit, and that one tail set the wave time of every training
+    step (7.5 % of Snowball R2E-Gym trajectories, 2026-09-05). Under the cap such a turn ends with
+    ``finish_reason="length"`` after ``max_generate_length`` tokens and Terminus-2 recovers it
+    (``_recover_output_overflow``) instead of the trial dying on context.
+
+    Writes the smaller of the cap and the client's own limit back to the keys the client used
+    (``max_tokens`` when it sent neither; vLLM prefers ``max_completion_tokens`` when both are set).
+    A client limit already at or below the cap is left untouched. Returns True when the body changed.
+    """
+    if not max_generate_length or int(max_generate_length) <= 0:
+        return False
+    cap = int(max_generate_length)
+    requested = [int(body[k]) for k in _OPENAI_MAX_TOKENS_KEYS if body.get(k) is not None]
+    if requested and min(requested) <= cap:
+        return False
+    body["max_tokens"] = cap
+    if "max_completion_tokens" in body:
+        body["max_completion_tokens"] = cap
+    return True
+
+
+def openai_error_message(response: Any) -> Optional[str]:
+    """The message of an OpenAI-style error response dict, or None for a non-error response.
+
+    Accepts both shapes the engine returns: vLLM >= 0.10 nests the fields under ``error``
+    (``ErrorInfo``); older vLLM and the flat fallback put ``message`` at the top level.
+    """
+    if not isinstance(response, dict):
+        return None
+    err = response.get("error")
+    if isinstance(err, dict):
+        return str(err.get("message", ""))
+    if "choices" not in response and (response.get("object") == "error" or "message" in response):
+        return str(response.get("message", ""))
+    return None
+
+
+def is_openai_output_budget_overflow(message: Optional[str]) -> bool:
+    """True for vLLM's validation error that the prompt plus the requested output does not fit.
+
+    vLLM derives ``max_input_tokens = max_model_len - max_output_tokens`` and rejects a longer
+    prompt with "This model's maximum context length is N tokens. However, you requested M output
+    tokens and your prompt contains ..." (``vllm/renderers/params.py``). A prompt that fits by
+    itself but leaves fewer than ``max_generate_length`` tokens is exactly the case the uncapped
+    request used to serve (vLLM then generates into the remaining room), so the caller retries it
+    without the cap. Uses the message text: the exception is raised inside vLLM's serving layer
+    and only its rendered form survives the engine's error handler.
+    """
+    if not message:
+        return False
+    return "maximum context length" in message and "output tokens" in message

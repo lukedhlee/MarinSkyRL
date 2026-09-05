@@ -69,6 +69,9 @@ from skyrl_train.models.grug_moe import is_grug_router_bias
 from skyrl_train.inference_engines.vllm.utils import (
     pop_openai_kwargs,
     ensure_token_ids_in_sse_chunk,
+    apply_openai_max_tokens_cap,
+    is_openai_output_budget_overflow,
+    openai_error_message,
     PrefixCacheHitRateAccumulator,
 )
 from skyrl_train.inference_engines.vllm.stats import (
@@ -1981,6 +1984,24 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             }
         )
 
+        # Bound the completion by the generator's max_generate_length, as the native path does.
+        # Without it an agent turn that sends no max_tokens generates into the whole remaining
+        # context (50k+ tokens, up to 17 min) and one such turn sets the wave time of a training
+        # step. A prompt that fits on its own but leaves less room than the cap is served the old
+        # way: vLLM rejects the capped request, and it is retried once uncapped.
+        uncapped_body = dict(body)
+        capped = apply_openai_max_tokens_cap(body, sp.get("max_generate_length"))
+        result = await self._serve_openai_body(body, headers, endpoint)
+        if capped and is_openai_output_budget_overflow(openai_error_message(result)):
+            logger.warning(
+                "OpenAI request capped at max_tokens={} does not fit beside its prompt; retrying uncapped",
+                body.get("max_tokens"),
+            )
+            result = await self._serve_openai_body(uncapped_body, headers, endpoint)
+        return result
+
+    async def _serve_openai_body(self, body: Dict[str, Any], headers: Dict[str, Any], endpoint: str) -> Dict[str, Any]:
+        """Build the vLLM request from ``body`` and serve it; errors come back as OpenAI error dicts."""
         # 1. Build request
         try:
             if endpoint == "/chat/completions":
@@ -2081,38 +2102,55 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         )
         body["stream"] = True
         body["return_token_ids"] = True  # force vLLM to emit per-chunk token_ids
+        # Same completion bound and uncapped retry as _handle_openai_request. vLLM rejects an
+        # over-budget request before the first chunk, so the retry never follows streamed output.
+        uncapped_body = dict(body)
+        capped = apply_openai_max_tokens_cap(body, sp.get("max_generate_length"))
+        attempts = [body, uncapped_body] if capped else [body]
 
-        try:
-            request = ChatCompletionRequest(**body)
-            minimal_request = _MinimalRequest(headers)
-            result = await self.openai_serving_chat.create_chat_completion(request, minimal_request)
+        for attempt, attempt_body in enumerate(attempts):
+            retry_uncapped = attempt == 0 and len(attempts) > 1
+            try:
+                request = ChatCompletionRequest(**attempt_body)
+                minimal_request = _MinimalRequest(headers)
+                result = await self.openai_serving_chat.create_chat_completion(request, minimal_request)
 
-            if isinstance(result, ErrorResponse):
-                err = result.model_dump()
+                if isinstance(result, ErrorResponse):
+                    err = result.model_dump()
+                    if retry_uncapped and is_openai_output_budget_overflow(openai_error_message(err)):
+                        continue
+                    yield f"data: {json.dumps(err)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                async for chunk in result:
+                    if isinstance(chunk, bytes):
+                        chunk = chunk.decode("utf-8")
+                    yield ensure_token_ids_in_sse_chunk(chunk)
+                return
+
+            except Exception as e:
+                if retry_uncapped and is_openai_output_budget_overflow(str(e)):
+                    logger.warning(
+                        "Streaming OpenAI request capped at max_tokens={} does not fit beside its prompt; retrying uncapped",
+                        body.get("max_tokens"),
+                    )
+                    continue
+                is_input_overflow = False
+                try:
+                    from vllm.exceptions import VLLMValidationError
+
+                    if isinstance(e, VLLMValidationError):
+                        param = getattr(e, "parameter", None)
+                        is_input_overflow = param == "input_tokens" or "input tokens" in str(e)
+                except ImportError:
+                    is_input_overflow = "input tokens" in str(e) and "context length" in str(e)
+
+                status = HTTPStatus.BAD_REQUEST if is_input_overflow else HTTPStatus.INTERNAL_SERVER_ERROR
+                err = _build_error_response(str(e), status.phrase, status.value)
                 yield f"data: {json.dumps(err)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
-
-            async for chunk in result:
-                if isinstance(chunk, bytes):
-                    chunk = chunk.decode("utf-8")
-                yield ensure_token_ids_in_sse_chunk(chunk)
-
-        except Exception as e:
-            is_input_overflow = False
-            try:
-                from vllm.exceptions import VLLMValidationError
-
-                if isinstance(e, VLLMValidationError):
-                    param = getattr(e, "parameter", None)
-                    is_input_overflow = param == "input_tokens" or "input tokens" in str(e)
-            except ImportError:
-                is_input_overflow = "input tokens" in str(e) and "context length" in str(e)
-
-            status = HTTPStatus.BAD_REQUEST if is_input_overflow else HTTPStatus.INTERNAL_SERVER_ERROR
-            err = _build_error_response(str(e), status.phrase, status.value)
-            yield f"data: {json.dumps(err)}\n\n"
-            yield "data: [DONE]\n\n"
 
     async def get_stats(self, read_mode: IntervalReadMode = IntervalReadMode.RESET) -> VLLMEngineStatsSnapshot:
         """Return the engine's complete typed snapshot without publishing it."""
