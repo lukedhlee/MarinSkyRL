@@ -11,6 +11,7 @@ from skyrl_train.inference_engines.vllm.utils import (
     apply_openai_max_tokens_cap,
     is_openai_output_budget_overflow,
     openai_error_message,
+    pop_openai_kwargs,
 )
 
 
@@ -78,3 +79,18 @@ def test_output_budget_overflow_matches_vllm_validation_text_only():
     assert is_openai_output_budget_overflow("CUDA error: an illegal memory access") is False
     assert is_openai_output_budget_overflow(None) is False
     assert is_openai_output_budget_overflow("") is False
+
+
+def test_cap_switch_is_popped_from_engine_kwargs_as_a_bool():
+    """``generator.openai_max_tokens_cap`` rides engine_init_kwargs and must never reach vLLM's engine args."""
+    engine_kwargs = {
+        "openai_max_tokens_cap": 1,
+        "openai_sampling_params": {"max_generate_length": 16384},
+        "other": "keep",
+    }
+    openai_kwargs = pop_openai_kwargs(engine_kwargs)
+    assert openai_kwargs["openai_max_tokens_cap"] is True
+    assert openai_kwargs["openai_sampling_params"] == {"max_generate_length": 16384}
+    assert engine_kwargs == {"other": "keep"}
+
+    assert "openai_max_tokens_cap" not in pop_openai_kwargs({"other": "keep"})

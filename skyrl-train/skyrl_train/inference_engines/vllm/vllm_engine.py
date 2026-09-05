@@ -1513,12 +1513,15 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         openai_kwargs = pop_openai_kwargs(kwargs)
         # Store sampling params for OpenAI-style requests (Harbor rollouts)
         self._openai_sampling_params = openai_kwargs.pop("openai_sampling_params", {})
+        self._openai_max_tokens_cap = bool(openai_kwargs.pop("openai_max_tokens_cap", False))
         if self._openai_sampling_params:
             logger.warning(
                 f"OpenAI API sampling params overridden: "
                 f"temperature={self._openai_sampling_params.get('temperature', 1.0)}, "
                 f"top_p={self._openai_sampling_params.get('top_p', 1.0)}, "
-                f"top_k={self._openai_sampling_params.get('top_k', -1)}"
+                f"top_k={self._openai_sampling_params.get('top_k', -1)}, "
+                f"max_tokens cap={'on' if self._openai_max_tokens_cap else 'off'}"
+                f" ({self._openai_sampling_params.get('max_generate_length')})"
             )
         # TODO (erictang000): potentially enable log requests for a debugging mode
         custom_chat_template_path = kwargs.pop("custom_chat_template_chat_completion_path", None)
@@ -1964,6 +1967,12 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
     # Methods for handling OpenAI API requests
     # ----------------------------------------
 
+    def _openai_max_tokens_cap_value(self) -> Optional[int]:
+        """``sampling_params.max_generate_length`` when ``generator.openai_max_tokens_cap`` is on, else None."""
+        if not getattr(self, "_openai_max_tokens_cap", False):
+            return None
+        return getattr(self, "_openai_sampling_params", {}).get("max_generate_length")
+
     async def _handle_openai_request(self, request_payload: Dict[str, Any], endpoint: str) -> Dict[str, Any]:
         """Handle OpenAI API request."""
         assert endpoint in ["/chat/completions", "/completions"]
@@ -1984,13 +1993,14 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             }
         )
 
-        # Bound the completion by the generator's max_generate_length, as the native path does.
-        # Without it an agent turn that sends no max_tokens generates into the whole remaining
-        # context (50k+ tokens, up to 17 min) and one such turn sets the wave time of a training
-        # step. A prompt that fits on its own but leaves less room than the cap is served the old
-        # way: vLLM rejects the capped request, and it is retried once uncapped.
+        # Bound the completion by the generator's max_generate_length, as the native path does
+        # (opt-in: generator.openai_max_tokens_cap). Without it an agent turn that sends no
+        # max_tokens generates into the whole remaining context (50k+ tokens, up to 17 min) and one
+        # such turn sets the wave time of a training step. A prompt that fits on its own but leaves
+        # less room than the cap is served the old way: vLLM rejects the capped request, and it is
+        # retried once uncapped.
         uncapped_body = dict(body)
-        capped = apply_openai_max_tokens_cap(body, sp.get("max_generate_length"))
+        capped = apply_openai_max_tokens_cap(body, self._openai_max_tokens_cap_value())
         result = await self._serve_openai_body(body, headers, endpoint)
         if capped and is_openai_output_budget_overflow(openai_error_message(result)):
             logger.warning(
@@ -2105,7 +2115,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         # Same completion bound and uncapped retry as _handle_openai_request. vLLM rejects an
         # over-budget request before the first chunk, so the retry never follows streamed output.
         uncapped_body = dict(body)
-        capped = apply_openai_max_tokens_cap(body, sp.get("max_generate_length"))
+        capped = apply_openai_max_tokens_cap(body, self._openai_max_tokens_cap_value())
         attempts = [body, uncapped_body] if capped else [body]
 
         for attempt, attempt_body in enumerate(attempts):

@@ -66,6 +66,11 @@ def pop_openai_kwargs(engine_kwargs: Dict[str, Any]) -> Dict[str, Any]:
     if tool_parser is not None:
         openai_kwargs["tool_parser"] = tool_parser
 
+    # Bound OpenAI-path completions at sampling_params.max_generate_length (see apply_openai_max_tokens_cap)
+    cap_flag = engine_kwargs.pop("openai_max_tokens_cap", None)
+    if cap_flag is not None:
+        openai_kwargs["openai_max_tokens_cap"] = bool(cap_flag)
+
     # Sampling params for OpenAI-style requests (Harbor terminal-bench rollouts)
     openai_sampling = engine_kwargs.pop("openai_sampling_params", None)
     if openai_sampling is not None:
@@ -143,6 +148,8 @@ def apply_openai_max_tokens_cap(body: Dict[str, Any], max_generate_length: Optio
     Writes the smaller of the cap and the client's own limit back to the keys the client used
     (``max_tokens`` when it sent neither; vLLM prefers ``max_completion_tokens`` when both are set).
     A client limit already at or below the cap is left untouched. Returns True when the body changed.
+    Opt-in per run via ``generator.openai_max_tokens_cap=true`` (the engine passes ``None`` as the cap
+    when it is off), so a mid-campaign code pull leaves running recipes and eval probes unchanged.
     """
     if not max_generate_length or int(max_generate_length) <= 0:
         return False
